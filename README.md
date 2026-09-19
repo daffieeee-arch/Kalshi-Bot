@@ -1,6 +1,6 @@
 # Kalshi-Bot
 
-Kalshi trading bot — separate from Hyperliquid.
+Kalshi trading bot.
 
 ## VPS path
 
