@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit:
     name: unit
@@ -51,10 +55,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          labels="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name]')"
-          if echo "$labels" | jq -e 'index("wip")' >/dev/null; then
+          meta="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels,headRefOid)"
+          current="$(echo "$meta" | jq -r '.headRefOid')"
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "stale event head ${HEAD_SHA} != current ${current}"
+            exit 0
+          fi
+          if echo "$meta" | jq -e '[.labels[].name] | index("wip")' >/dev/null; then
             echo "wip label present; leave draft"
             exit 0
           fi
