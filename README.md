@@ -1,7 +1,8 @@
 # Kalshi-Bot
 
-DEMO-only Kalshi Trade API scaffold for **Bitcoin 15-minute up/down** markets (`KXBTC15M`).
-No trading strategy — first slice is client + discover + RSA-PSS auth.
+Kalshi **Bitcoin 15-minute** (`KXBTC15M`) client: demo plumbing, **production WebSocket** for live data, local paper fills. No production orders.
+
+Docs: [docs.kalshi.com](https://docs.kalshi.com/) (environments, demo env, WebSockets, orderbook updates, public trades, CF Benchmarks).
 
 ## VPS path
 
@@ -9,16 +10,21 @@ No trading strategy — first slice is client + discover + RSA-PSS auth.
 
 Develop with Cursor (Remote SSH) or Codex against this directory.
 
-## Hard lock: DEMO only
+## Environments
 
-| Surface | URL |
+| Surface | Host |
 | --- | --- |
-| REST | `https://external-api.demo.kalshi.co/trade-api/v2` |
-| WebSocket | `wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2` |
+| Demo REST / WS | `external-api.demo.kalshi.co` / `external-api-ws.demo.kalshi.co` |
+| Production REST / WS | `external-api.kalshi.com` / `external-api-ws.kalshi.com` |
 
-`KALSHI_ENV` must be `demo`. Production hosts are rejected in config.
+- `KALSHI_ENV=demo` — demo client cannot point at production.
+- `KALSHI_DATA_ENV=production` — live book, trades, BRTI come from the production WebSocket. REST is only used to find the open window. There is no REST-orderbook fallback.
+- `KALSHI_TRADE_ENV=paper` (default). `live` is refused. Demo POST is plumbing only.
+- Production POST/PUT/PATCH/DELETE are blocked in code.
 
-Docs verified against: [Kalshi llms.txt](https://docs.kalshi.com/llms.txt) (API environments, demo env, market data, authenticated requests, SDKs).
+Kalshi’s [demo env](https://docs.kalshi.com/getting_started/demo_env) is not a live book. Do not use demo quotes for fair value or EV.
+
+Docs verified against: [Kalshi llms.txt](https://docs.kalshi.com/llms.txt).
 
 > Note: The official `kalshi_python_sync` SDK (3.2.0) currently fails to deserialize live market payloads after Kalshi’s fixed-point dollar fields. This repo uses a thin signed `httpx` client matching the official RSA-PSS scheme so public discover works today.
 
@@ -26,14 +32,17 @@ Docs verified against: [Kalshi llms.txt](https://docs.kalshi.com/llms.txt) (API 
 
 ```
 src/kalshi_bot/
-  config.py      # demo endpoints + env loading
+  config.py      # demo vs production hosts, TRADE/DATA env
   auth.py        # RSA-PSS request signing
-  client.py      # DEMO HTTP client
+  client.py      # demo client + production GET-only client
+  ws.py          # signed production WebSocket
+  orderbook.py   # snapshot + delta, no gap fill
+  record.py      # append-only JSONL
+  recorder.py    # 24/7 loop + lock
+  paper.py       # local paper ledger
+  fees.py        # quadratic taker fee
   discover.py    # KXBTC15M open-market discovery
-  cli.py         # discover-btc-15m entrypoint
-tests/
-  test_smoke_demo.py
-.env.example
+  cli.py         # discover-btc-15m + record-btc-15m
 ```
 
 ## Setup
@@ -61,18 +70,31 @@ KALSHI_API_KEY_ID=your-key-id
 KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/demo-key.key
 ```
 
+Production recorder keys (required for `record-btc-15m`):
+
+```env
+KALSHI_DATA_ENV=production
+KALSHI_TRADE_ENV=paper
+KALSHI_PROD_API_KEY_ID=your-prod-key-id
+KALSHI_PROD_PRIVATE_KEY_PATH=/absolute/path/to/prod-kalshi.key
+```
+
 Never commit `.env`, `*.key`, or `*.pem`.
 
 ## Run
 
-Discover current open `KXBTC15M` markets (ticker / title / close_time / quotes / floor_strike):
+Discover current open `KXBTC15M` markets on **demo** (ticker / title / close_time / quotes / floor_strike):
 
 ```bash
 discover-btc-15m
-# or
-python -m kalshi_bot.cli
-# JSON:
 discover-btc-15m --json
+```
+
+Record the **production** WebSocket (fails hard without a live key). Writes `data/prod-kxbtc15m.jsonl`. Optional local paper order:
+
+```bash
+record-btc-15m --seconds 30
+record-btc-15m --paper-style maker --paper-outcome yes --paper-price 0.40 --paper-count 5
 ```
 
 If credentials are present, the CLI also prints demo portfolio balance. If not, it prints setup steps and still completes public discover.
@@ -115,4 +137,4 @@ See [Authenticated requests](https://docs.kalshi.com/getting_started/quick_start
 
 ## Status
 
-Greenfield scaffold. No orders, no strategy, no Hyperliquid coupling.
+Production data + local paper. No production orders. No Hyperliquid coupling.
