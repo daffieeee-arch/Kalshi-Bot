@@ -58,7 +58,7 @@ jobs:
           fi
           [ -n "${number:-}" ] || { echo "no open PR"; exit 0; }
 
-          meta="$(gh pr view "$number" --repo "$REPO" --json isDraft,mergeable,labels,state,headRefOid)"
+          meta="$(gh pr view "$number" --repo "$REPO" --json isDraft,mergeable,labels,state,headRefOid,statusCheckRollup)"
           echo "$meta"
           current="$(echo "$meta" | jq -r '.headRefOid')"
           if [ "$current" != "$HEAD_SHA" ]; then
@@ -74,7 +74,7 @@ jobs:
             exit 0
           fi
 
-          unit="$(gh pr checks "$number" --repo "$REPO" --json name,state,conclusion --jq '.[] | select(.name=="unit") | .conclusion' | head -n1)"
+          unit="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit")] | last | .conclusion')"
           echo "unit=$unit"
           if [ "$unit" != "SUCCESS" ]; then
             echo "unit is not green"
