@@ -1,0 +1,16 @@
+{
+  "type": "cfbenchmarks_value",
+  "sid": 1,
+  "seq": 42,
+  "msg": {
+    "index_id": "BRTI",
+    "received_at": 1710000000123,
+    "data": "{\"type\":\"value\",\"id\":\"BRTI\",\"time\":1710000000123,\"value\":\"68000.12\"}",
+    "avg_60s_data": {
+      "value": "68000.12000000",
+      "window_size": 3,
+      "window_start_ts_ms": 1709999940123,
+      "window_end_ts_exclusive": 1710000000123
+    }
+  }
+}

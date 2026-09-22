@@ -22,12 +22,19 @@ Docs verified against: [Kalshi llms.txt](https://docs.kalshi.com/llms.txt) (API 
 src/kalshi_bot/
   config.py      # demo endpoints + env loading
   auth.py        # RSA-PSS request signing
-  client.py      # DEMO HTTP client
+  client.py      # DEMO HTTP client (no order API)
   discover.py    # KXBTC15M open-market discovery
+  ws.py          # DEMO WebSocket handshake and subscriptions
+  orderbook.py   # snapshot + delta book
+  brti.py        # BRTI parse and quarter-hour window
+  record.py      # JSONL + Parquet segments
+  recorder.py    # rollover loop, lock, health
+  clockcheck.py  # host clock / disk status
   cli.py         # discover-btc-15m entrypoint
+deploy/kalshi-recorder.service
 tests/
   test_smoke_demo.py
-.env.example
+data/            # gitignored raw recorder output
 ```
 
 ## Setup
@@ -89,6 +96,51 @@ Authenticated requests send:
 
 See [Authenticated requests](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests) and [API Keys](https://docs.kalshi.com/getting_started/api_keys).
 
+## Record
+
+`record-kxbtc15m` appends read-only DEMO market data for `KXBTC15M`. It does not place orders. Every row is tagged `source_env=demo` and `schema_version=1`. Demo prices are not production prices.
+
+Streams under `data/raw/source_env=demo/date=YYYY-MM-DD/stream=<name>/`:
+
+- `market` — raw market payload plus `fee_type` / `fee_multiplier` from the series, and event fee overrides when the API sends them. `quadratic_with_maker_fees` is stored as-is; maker fees are not assumed to be zero.
+- `orderbook` — snapshots and deltas. A sequence gap invalidates the local book until a fresh snapshot.
+- `trade` — public trades. Aggressor fields are stored only when present.
+- `brti` / `brti_5hz` — CF Benchmarks `BRTI` (1 Hz averages, plus 5 Hz ticks).
+- `lifecycle` — market lifecycle, including determination and settlement.
+- `health` — gaps, reconnects, stale feeds, missing BRTI.
+
+JSONL is the raw log. Closed segments are also compacted to ZSTD Parquet beside the JSONL file. Query example, read-only:
+
+```sql
+SELECT received_at, value, final_minute_value
+FROM read_parquet('data/raw/source_env=demo/date=*/stream=brti/*.parquet')
+ORDER BY received_at;
+```
+
+One process holds `data/recorder.lock`. A second start exits.
+
+```bash
+record-kxbtc15m
+# or
+python -m kalshi_bot.recorder --data-dir data
+```
+
+Logs are JSON on stdout. They do not include the API key or private key.
+
+### systemd
+
+Docker is not used. After a manual smoke, install the unit (root) and restart the service. Do not reboot the host just to test it.
+
+```bash
+sudo cp deploy/kalshi-recorder.service /etc/systemd/system/kalshi-recorder.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now kalshi-recorder.service
+sudo systemctl restart kalshi-recorder.service
+sudo systemctl status kalshi-recorder.service
+journalctl -u kalshi-recorder.service -f
+```
+
 ## Status
 
-Greenfield scaffold. No orders, no strategy, no Hyperliquid coupling.
+DEMO market-data recorder. No strategy and no order placement.
+

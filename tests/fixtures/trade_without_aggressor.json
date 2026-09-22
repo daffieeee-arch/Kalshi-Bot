@@ -1,0 +1,13 @@
+{
+  "type": "trade",
+  "sid": 11,
+  "seq": 2,
+  "msg": {
+    "trade_id": "d91bc706-ee49-470d-82d8-11418bda6fed",
+    "market_ticker": "KXBTC15M-TEST",
+    "yes_price_dollars": "0.3600",
+    "no_price_dollars": "0.6400",
+    "count_fp": "136.00",
+    "ts_ms": 1669149841000
+  }
+}

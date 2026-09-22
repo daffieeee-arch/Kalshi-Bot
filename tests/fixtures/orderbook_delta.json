@@ -1,0 +1,13 @@
+{
+  "type": "orderbook_delta",
+  "sid": 2,
+  "seq": 3,
+  "msg": {
+    "market_ticker": "KXBTC15M-TEST",
+    "market_id": "9b0f6b43-5b68-4f9f-9f02-9a2d1b8ac1a1",
+    "price_dollars": "0.2200",
+    "delta_fp": "5.00",
+    "side": "yes",
+    "ts_ms": 1669149841000
+  }
+}

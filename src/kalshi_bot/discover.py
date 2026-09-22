@@ -56,6 +56,29 @@ def discover_btc_15m(client: KalshiDemoClient) -> list[dict[str, Any]]:
     return [summarize_market(m) for m in open_markets]
 
 
+def current_btc_15m_window(client: KalshiDemoClient) -> dict[str, Any] | None:
+    """Return the active KXBTC15M window that closes soonest.
+
+    ``GET /markets?status=open`` can return stale rows. The open event payload
+    carries the window that is actually trading.
+    """
+    payload = client.get_events(
+        series_ticker=SERIES_TICKER_BTC_15M,
+        status="open",
+        with_nested_markets=True,
+        limit=20,
+    )
+    windows: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        for market in event.get("markets") or []:
+            if is_currently_open(market):
+                windows.append(summarize_market(market))
+    if not windows:
+        return None
+    windows.sort(key=lambda m: m.get("close_time") or "")
+    return windows[0]
+
+
 def format_market_line(summary: dict[str, Any]) -> str:
     return (
         f"{summary['ticker']}\n"

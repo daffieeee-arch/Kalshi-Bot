@@ -1,0 +1,19 @@
+[Unit]
+Description=Kalshi DEMO KXBTC15M market-data recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chupa
+Group=chupa
+WorkingDirectory=/home/chupa/Kalshi-Project/Kalshi-Bot
+EnvironmentFile=/home/chupa/Kalshi-Project/Kalshi-Bot/.env
+ExecStart=/home/chupa/Kalshi-Project/Kalshi-Bot/.venv/bin/record-kxbtc15m --data-dir /home/chupa/Kalshi-Project/Kalshi-Bot/data
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -49,6 +49,7 @@ class KalshiDemoClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
         authenticated: bool = False,
     ) -> Any:
         headers: dict[str, str] = {}
@@ -71,7 +72,13 @@ class KalshiDemoClient:
                 )
             )
 
-        response = self._client.request(method, path.lstrip("/"), params=params, headers=headers)
+        response = self._client.request(
+            method,
+            path.lstrip("/"),
+            params=params,
+            json=json_body,
+            headers=headers,
+        )
         response.raise_for_status()
         if not response.content:
             return None
@@ -79,6 +86,16 @@ class KalshiDemoClient:
 
     def get(self, path: str, *, params: dict[str, Any] | None = None, authenticated: bool = False) -> Any:
         return self.request("GET", path, params=params, authenticated=authenticated)
+
+    def post(
+        self,
+        path: str,
+        *,
+        json_body: dict[str, Any],
+        authenticated: bool = False,
+    ) -> Any:
+        """Transport helper for a JSON body. This is not an order API."""
+        return self.request("POST", path, json_body=json_body, authenticated=authenticated)
 
     def get_markets(
         self,
@@ -117,6 +134,14 @@ class KalshiDemoClient:
 
     def get_series(self, series_ticker: str) -> dict[str, Any]:
         return self.get(f"/series/{series_ticker}")
+
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        """Public market payload, including settlement fields once determined."""
+        return self.get(f"/markets/{ticker}")
+
+    def get_event(self, event_ticker: str) -> dict[str, Any]:
+        """Public event payload. Fee overrides, when present, are copied by the recorder."""
+        return self.get(f"/events/{event_ticker}")
 
     def get_balance(self) -> dict[str, Any]:
         """Authenticated portfolio balance (demo funds)."""
