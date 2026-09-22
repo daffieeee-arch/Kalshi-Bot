@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import signal
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +27,10 @@ log = logging.getLogger("kalshi_bot.recorder")
 DEFAULT_JSONL = Path("data/prod-kxbtc15m.jsonl")
 DEFAULT_LOCK = Path("data/recorder.lock")
 _BACKOFF_CAP_S = 60.0
+DISCOVER_INTERVAL_S = 15.0
+# Close tick is at :00/:15/:30/:45 (window_size 60). Keep the just-closed
+# ticker only long enough to catch a late BRTI close, not the next slot.
+SETTLE_PENDING_S = 90.0
 
 
 @dataclass
@@ -57,6 +62,9 @@ class Recorder:
         self.subs = Subscriptions()
         self.ticker: str | None = None
         self.floor_strike: Decimal | None = None
+        self.pending_settle_ticker: str | None = None
+        self.pending_settle_strike: Decimal | None = None
+        self.pending_settle_until: float | None = None
         self._stop = asyncio.Event()
         self._lock_fh: TextIO | None = None
         self._reconnects = 0
@@ -116,7 +124,7 @@ class Recorder:
 
     async def _maybe_discover(self, ws: ProductionWebSocket, rest: KalshiReadClient) -> None:
         now = asyncio.get_running_loop().time()
-        if self.ticker is not None and now - self._last_discover < 15.0:
+        if now - self._last_discover < DISCOVER_INTERVAL_S:
             return
         self._last_discover = now
         nxt = _open_market(rest)
@@ -231,22 +239,49 @@ class Recorder:
         if self.subs.trade is None:
             await ws.subscribe(channels=["trade"], market_tickers=[ticker])
         self.book.reset()
+        self._remember_closed_window()
         self.ticker = ticker
         self.floor_strike = Decimal(str(floor_strike)) if floor_strike is not None else None
         log.info("rolled to %s", ticker)
 
-    def _maybe_settle(self, payload: dict[str, Any]) -> None:
+    def _remember_closed_window(self, *, now: float | None = None) -> None:
+        if self.ticker is None:
+            return
+        self.pending_settle_ticker = self.ticker
+        self.pending_settle_strike = self.floor_strike
+        self.pending_settle_until = (time.monotonic() if now is None else now) + SETTLE_PENDING_S
+
+    def _settlement_market(self, *, now: float | None = None) -> tuple[str | None, Decimal | None]:
+        clock = time.monotonic() if now is None else now
+        if self.pending_settle_ticker is not None:
+            deadline = self.pending_settle_until
+            if deadline is not None and clock > deadline:
+                self.pending_settle_ticker = None
+                self.pending_settle_strike = None
+                self.pending_settle_until = None
+            else:
+                return self.pending_settle_ticker, self.pending_settle_strike
+        return self.ticker, self.floor_strike
+
+    def _clear_pending_settle(self) -> None:
+        self.pending_settle_ticker = None
+        self.pending_settle_strike = None
+        self.pending_settle_until = None
+
+    def _maybe_settle(self, payload: dict[str, Any], *, now: float | None = None) -> None:
         window = payload.get("last_60s_windowed_average_15min")
-        if not isinstance(window, dict) or self.ticker is None or self.floor_strike is None:
+        ticker, strike = self._settlement_market(now=now)
+        if not isinstance(window, dict) or ticker is None or strike is None:
             return
         if int(window.get("window_size") or 0) < 60:
             return
         close_avg = Decimal(str(window["value"]))
         self.paper.on_settlement(
-            market_ticker=self.ticker,
+            market_ticker=ticker,
             close_avg=close_avg,
-            floor_strike=self.floor_strike,
+            floor_strike=strike,
         )
+        self._clear_pending_settle()
 
     async def _backoff(self) -> None:
         self._reconnects += 1
