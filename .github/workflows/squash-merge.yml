@@ -13,48 +13,72 @@ permissions:
   checks: read
 
 concurrency:
-  group: squash-merge-${{ github.event.pull_request.number || github.event.workflow_run.head_branch }}
+  group: squash-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   drop-stale-review:
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Remove review-passed after new commits
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/review-passed" || true
+          gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/review-passed" || true
 
   merge:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.action != 'synchronize' &&
-       github.event.pull_request.draft == false) ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - name: Squash-merge if reviewed and unit is green
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          repo="${{ github.repository }}"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            number="${{ github.event.pull_request.number }}"
-          else
-            number="$(gh pr list --repo "$repo" --head "${{ github.event.workflow_run.head_branch }}" --state open --json number --jq '.[0].number // empty')"
+          number="${PR_NUMBER:-}"
+          if [ -z "$number" ]; then
+            number="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[0].number // empty')"
           fi
           [ -n "${number:-}" ] || { echo "no open PR"; exit 0; }
 
-          meta="$(gh pr view "$number" --repo "$repo" --json isDraft,mergeable,labels,state)"
+          meta="$(gh pr view "$number" --repo "$REPO" --json isDraft,mergeable,labels,state,headRefOid)"
           echo "$meta"
-          echo "$meta" | jq -e '.state == "OPEN" and .isDraft == false and .mergeable == "MERGEABLE"' >/dev/null
-          echo "$meta" | jq -e '[.labels[].name] | index("review-passed")' >/dev/null
+          current="$(echo "$meta" | jq -r '.headRefOid')"
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "stale event head ${HEAD_SHA} != current ${current}"
+            exit 0
+          fi
+          if ! echo "$meta" | jq -e '.state == "OPEN" and .isDraft == false and .mergeable == "MERGEABLE"' >/dev/null; then
+            echo "PR is not ready to merge"
+            exit 0
+          fi
+          if ! echo "$meta" | jq -e '[.labels[].name] | index("review-passed")' >/dev/null; then
+            echo "review-passed label missing"
+            exit 0
+          fi
 
-          unit="$(gh pr checks "$number" --repo "$repo" --json name,state,conclusion --jq '.[] | select(.name=="unit") | .conclusion' | head -n1)"
+          unit="$(gh pr checks "$number" --repo "$REPO" --json name,state,conclusion --jq '.[] | select(.name=="unit") | .conclusion' | head -n1)"
           echo "unit=$unit"
-          [ "$unit" = "SUCCESS" ]
+          if [ "$unit" != "SUCCESS" ]; then
+            echo "unit is not green"
+            exit 0
+          fi
 
-          gh pr merge "$number" --repo "$repo" --squash --delete-branch
+          gh pr merge "$number" --repo "$REPO" --squash --delete-branch
