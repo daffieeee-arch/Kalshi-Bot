@@ -1,0 +1,4 @@
+# Place demo RSA private keys here locally (never commit).
+# Example: keys/demo-kalshi.key
+*
+!.gitignore
