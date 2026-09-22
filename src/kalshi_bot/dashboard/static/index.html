@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KXBTC15M live</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/dashboard.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div>
+        <p class="eyebrow">Kalshi production · paper only</p>
+        <h1>KXBTC15M</h1>
+      </div>
+      <div class="status-row">
+        <span id="recorder-pill" class="pill off">recorder</span>
+        <span id="book-pill" class="pill off">book</span>
+        <button id="pause" type="button">Pause</button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <article>
+        <p class="label">Market</p>
+        <p id="ticker" class="big mono">waiting…</p>
+        <p id="title" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">Close</p>
+        <p id="countdown" class="big mono">--:--</p>
+        <p id="close-at" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">BRTI</p>
+        <p id="brti" class="big mono">—</p>
+        <p id="brti-meta" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">YES</p>
+        <p id="yes-quote" class="big mono yes">—</p>
+        <p id="strike" class="muted"></p>
+      </article>
+    </section>
+
+    <section class="hero">
+      <article>
+        <p class="label">BRTI − strike</p>
+        <p id="gap" class="big mono">—</p>
+        <p id="gap-meta" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">Model P(YES)</p>
+        <p id="model-p" class="big mono">—</p>
+        <p id="model-meta" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">Edge vs book</p>
+        <p id="edge" class="big mono">—</p>
+        <p id="edge-meta" class="muted"></p>
+      </article>
+      <article>
+        <p class="label">Paper hint</p>
+        <p id="hint" class="big mono">wait</p>
+        <p id="hint-meta" class="muted">local only · no live orders</p>
+      </article>
+    </section>
+
+    <section class="toolbar">
+      <fieldset>
+        <legend>Book depth</legend>
+        <label><input type="radio" name="depth" value="5" /> 5</label>
+        <label><input type="radio" name="depth" value="10" checked /> 10</label>
+        <label><input type="radio" name="depth" value="15" /> 15</label>
+      </fieldset>
+      <fieldset>
+        <legend>Tape</legend>
+        <label><input type="radio" name="tape" value="all" checked /> all</label>
+        <label><input type="radio" name="tape" value="yes" /> YES taker</label>
+        <label><input type="radio" name="tape" value="no" /> NO taker</label>
+      </fieldset>
+      <p id="focus" class="focus muted">Click a book row to pin a price.</p>
+      <p id="file-meta" class="muted mono"></p>
+    </section>
+
+    <main class="grid">
+      <section class="panel">
+        <h2>Order book</h2>
+        <div class="book-head">
+          <span>YES bid</span>
+          <span>size</span>
+          <span>NO bid</span>
+          <span>size</span>
+        </div>
+        <div id="book" class="book"></div>
+      </section>
+      <section class="panel">
+        <h2>Public tape</h2>
+        <div id="tape" class="tape"></div>
+      </section>
+    </main>
+
+    <footer>
+      <div id="rates" class="chips"></div>
+      <p id="error" class="error" hidden></p>
+    </footer>
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>
