@@ -9,8 +9,11 @@ import logging
 import sys
 from decimal import Decimal
 
+import uvicorn
+
 from kalshi_bot.client import KalshiDemoClient
 from kalshi_bot.config import SERIES_TICKER_BTC_15M, load_settings, require_prod_credentials
+from kalshi_bot.dashboard.app import create_app
 from kalshi_bot.discover import discover_btc_15m, format_market_line
 from kalshi_bot.paper import PaperIntent
 from kalshi_bot.recorder import run_recorder
@@ -126,6 +129,22 @@ def record_main(argv: list[str] | None = None) -> None:
     parser = build_record_parser()
     args = parser.parse_args(argv)
     raise SystemExit(cmd_record_btc_15m(args))
+
+
+def build_dashboard_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dashboard-btc-15m",
+        description="Local interactive view of the production KXBTC15M capture.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8787)
+    return parser
+
+
+def dashboard_main(argv: list[str] | None = None) -> None:
+    parser = build_dashboard_parser()
+    args = parser.parse_args(argv)
+    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

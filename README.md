@@ -42,7 +42,8 @@ src/kalshi_bot/
   paper.py       # local paper ledger
   fees.py        # quadratic taker fee
   discover.py    # KXBTC15M open-market discovery
-  cli.py         # discover-btc-15m + record-btc-15m
+  cli.py         # discover-btc-15m + record-btc-15m + dashboard-btc-15m
+  dashboard/     # local live overview of the JSONL capture
 ```
 
 ## Setup
@@ -96,6 +97,14 @@ Record the **production** WebSocket (fails hard without a live key). Writes `dat
 record-btc-15m --seconds 30
 record-btc-15m --paper-style maker --paper-outcome yes --paper-price 0.40 --paper-count 5
 ```
+
+Local interactive dashboard over that capture (does not place orders):
+
+```bash
+dashboard-btc-15m
+```
+
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787). The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown. Pause, depth, and tape filters stay in the browser.
 
 If credentials are present, the CLI also prints demo portfolio balance. If not, it prints setup steps and still completes public discover.
 
