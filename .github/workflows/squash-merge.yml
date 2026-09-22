@@ -12,9 +12,10 @@ permissions:
   pull-requests: write
   checks: read
 
+# Queue, do not cancel: a later merge run must not abort drop-stale-review.
 concurrency:
   group: squash-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   drop-stale-review:
