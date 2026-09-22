@@ -110,7 +110,7 @@ On any machine in the Tailscale tailnet (Mac, phone, …):
 [https://chupa.tail9f5972.ts.net:8443](https://chupa.tail9f5972.ts.net:8443)
 (tailnet only; the existing `https://chupa.tail9f5972.ts.net/` app on :443 is unchanged).
 
-The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown. Pause, depth, and tape filters stay in the browser.
+The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders.
 
 If credentials are present, the CLI also prints demo portfolio balance. If not, it prints setup steps and still completes public discover.
 

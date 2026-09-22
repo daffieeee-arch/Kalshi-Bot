@@ -18,6 +18,7 @@ from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import is_currently_open, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
+from kalshi_bot.signal import evaluate, realized_sigma, signal_to_dict
 
 _NY = ZoneInfo("America/New_York")
 _MONTHS = {
@@ -37,10 +38,20 @@ _MONTHS = {
 _TICKER_PREFIX = "KXBTC15M-"
 def _is_snapshot_line(line: bytes) -> bool:
     return b'"stream":"orderbook_snapshot"' in line or b'"stream": "orderbook_snapshot"' in line
-_LOOKBACK_BYTES = 256_000_000
+_LOOKBACK_BYTES = None
 _CHUNK_BYTES = 4_000_000
 _TAPE_MAX = 80
 _RATE_WINDOW_S = 5.0
+_SPOT_WINDOW = 90
+STREAM_LABELS = {
+    "cfbenchmarks_value": "BRTI 1 Hz",
+    "cfbenchmarks_value_5hz": "BRTI 5 Hz",
+    "orderbook_delta": "book deltas",
+    "orderbook_snapshot": "book snapshot",
+    "trade": "tape",
+    "subscribed": "subscribe ack",
+    "ok": "command ack",
+}
 
 
 def parse_kxbtc15m_close(ticker: str) -> datetime | None:
@@ -93,6 +104,7 @@ class LiveFeed:
         self._rate_times: deque[tuple[float, str]] = deque()
         self._tape: deque[dict[str, Any]] = deque(maxlen=_TAPE_MAX)
         self._brti: dict[str, Any] = {}
+        self._spots: deque[Decimal] = deque(maxlen=_SPOT_WINDOW)
         self._market: dict[str, Any] = {}
         self._last_row_at: str | None = None
         self._book_status = "waiting_snapshot"
@@ -121,6 +133,23 @@ class LiveFeed:
             no_ask = self.book.implied_ask("no")
             ticker = self.book.market_ticker or self._market.get("ticker")
             close_at = parse_kxbtc15m_close(str(ticker)) if ticker else None
+            seconds_left = None
+            if close_at is not None:
+                seconds_left = (close_at - datetime.now(timezone.utc)).total_seconds()
+            strike = self._market.get("floor_strike")
+            spot = self._brti.get("value")
+            close_avg = self._brti.get("close_avg")
+            close_window = self._brti.get("close_window")
+            signal = evaluate(
+                spot=Decimal(str(spot)) if spot is not None else None,
+                strike=Decimal(str(strike)) if strike is not None else None,
+                seconds_left=seconds_left,
+                close_avg=Decimal(str(close_avg)) if close_avg is not None else None,
+                close_window=int(close_window) if close_window is not None else None,
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+                sigma=realized_sigma(list(self._spots)),
+            )
             return {
                 "recorder": self._recorder_status(),
                 "book_status": self._book_status,
@@ -139,9 +168,9 @@ class LiveFeed:
                     "no_ask": _dec(no_ask),
                 },
                 "brti": dict(self._brti),
+                "signal": signal_to_dict(signal),
                 "tape": list(self._tape),
-                "counts": dict(self._counts),
-                "rates": rates,
+                "streams": _stream_view(self._counts, rates),
                 "last_row_at": self._last_row_at,
             }
 
@@ -162,6 +191,10 @@ class LiveFeed:
         start = _last_snapshot_offset(path)
         with self._lock:
             self.book.reset()
+            self._counts.clear()
+            self._rate_times.clear()
+            self._tape.clear()
+            self._spots.clear()
             self._book_status = "replaying" if start is not None else "waiting_snapshot"
             self._error = None
         offset = start if start is not None else path.stat().st_size
@@ -217,6 +250,7 @@ class LiveFeed:
                 )
             elif stream == "cfbenchmarks_value":
                 self._brti = _brti_view(msg)
+                self._remember_spot(self._brti.get("value"))
             elif stream == "cfbenchmarks_value_5hz":
                 current = _brti_spot(msg)
                 if current is not None:
@@ -257,6 +291,11 @@ class LiveFeed:
             else None,
         }
 
+    def _remember_spot(self, value: Any) -> None:
+        if value is None:
+            return
+        self._spots.append(Decimal(str(value)))
+
     def _rates(self, now: float) -> dict[str, float]:
         while self._rate_times and now - self._rate_times[0][0] > _RATE_WINDOW_S:
             self._rate_times.popleft()
@@ -265,6 +304,21 @@ class LiveFeed:
             counts[stream] = counts.get(stream, 0) + 1
         window = _RATE_WINDOW_S
         return {name: round(count / window, 2) for name, count in sorted(counts.items())}
+
+
+def _stream_view(counts: dict[str, int], rates: dict[str, float]) -> list[dict[str, Any]]:
+    keys = sorted(counts)
+    out: list[dict[str, Any]] = []
+    for key in keys:
+        out.append(
+            {
+                "id": key,
+                "label": STREAM_LABELS.get(key, key),
+                "count": counts[key],
+                "per_sec": rates.get(key, 0.0),
+            }
+        )
+    return out
 
 
 def _brti_spot(msg: dict[str, Any]) -> str | None:
@@ -292,9 +346,9 @@ def _brti_view(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _last_snapshot_offset(path: Path, *, max_bytes: int = _LOOKBACK_BYTES) -> int | None:
+def _last_snapshot_offset(path: Path, *, max_bytes: int | None = _LOOKBACK_BYTES) -> int | None:
     size = path.stat().st_size
-    floor = max(0, size - max_bytes)
+    floor = 0 if max_bytes is None else max(0, size - max_bytes)
     end = size
     found: int | None = None
     while end > floor:

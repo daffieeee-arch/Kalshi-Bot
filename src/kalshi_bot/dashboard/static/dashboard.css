@@ -149,6 +149,13 @@ input:focus-visible {
   color: var(--yes);
 }
 
+#model-meta,
+#hint-meta,
+#edge-meta,
+#gap-meta {
+  overflow-wrap: anywhere;
+}
+
 .no {
   color: var(--no);
 }

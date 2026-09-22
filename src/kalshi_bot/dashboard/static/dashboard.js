@@ -72,9 +72,10 @@ function render(data) {
   $("file-meta").textContent = `${fmtBytes(recorder.bytes)} · ${data.last_row_at || ""}`;
   $("error").hidden = !data.error;
   $("error").textContent = data.error || "";
+  renderSignal(data.signal || {});
   renderBook(book);
   renderTape(data.tape || []);
-  renderRates(data.rates || {}, data.counts || {});
+  renderRates(data.streams || []);
   if (state.focus) {
     $("focus").textContent = `Pinned ${state.focus.side.toUpperCase()} ${fmtPx(state.focus.price)}`;
     $("focus").classList.remove("muted");
@@ -147,15 +148,44 @@ function renderTape(tape) {
   }
 }
 
-function renderRates(rates, counts) {
+function signedUsd(value) {
+  if (value == null || value === "") return "—";
+  const n = Number(value);
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+}
+
+function renderSignal(signal) {
+  $("gap").textContent = signedUsd(signal.gap);
+  $("gap").className = `big mono ${Number(signal.gap) >= 0 ? "yes" : "no"}`;
+  $("gap-meta").textContent = signal.regime === "last_minute" ? "last minute" : "mid-window";
+  $("model-p").textContent = signal.model_yes == null ? "—" : Number(signal.model_yes).toFixed(2);
+  $("model-meta").textContent = signal.note || "";
+  const yesEdge = signal.yes_edge == null ? null : Number(signal.yes_edge);
+  const noEdge = signal.no_edge == null ? null : Number(signal.no_edge);
+  let edge = yesEdge;
+  let edgeLabel = "YES ask";
+  if ((noEdge ?? -99) > (yesEdge ?? -99)) {
+    edge = noEdge;
+    edgeLabel = "NO ask";
+  }
+  $("edge").textContent = edge == null ? "—" : signedUsd(edge);
+  $("edge").className = `big mono ${edge != null && edge >= 0 ? "yes" : "no"}`;
+  $("edge-meta").textContent = `after taker fee · ${edgeLabel}`;
+  $("hint").textContent = signal.hint || "wait";
+  $("hint").className = `big mono ${
+    signal.hint === "paper YES?" ? "yes" : signal.hint === "paper NO?" ? "no" : ""
+  }`;
+}
+
+function renderRates(streams) {
   const root = $("rates");
   root.replaceChildren();
-  const keys = Object.keys(counts).sort();
-  for (const key of keys) {
+  for (const row of streams) {
     const chip = document.createElement("span");
     chip.className = "chip";
-    const perSec = rates[key] != null ? `${rates[key]}/s` : "0/s";
-    chip.textContent = `${key} ${counts[key]} · ${perSec}`;
+    chip.title = `${row.id} · ${row.count} events this session`;
+    chip.textContent = `${row.label} ${Number(row.per_sec).toFixed(1)}/s`;
     root.append(chip);
   }
 }
