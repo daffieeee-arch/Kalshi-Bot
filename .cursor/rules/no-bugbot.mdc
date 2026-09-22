@@ -1,0 +1,12 @@
+---
+description: Bugbot is reviewer-only; it must not write code or merge
+alwaysApply: true
+---
+
+# Bugbot is reviewer-only
+
+Bugbot may run as a free, read-only reviewer when Chupa asks or when CI has just gone green on a ready PR. It must not write code, push, apply labels, or merge.
+
+Do not start paid Bugbot products or the Bugbot GitHub app billing flow.
+
+After a clean Bugbot review, the authoring agent (not Bugbot) may add `review-passed`. Findings are fixed by the authoring agent, then reviewed again.

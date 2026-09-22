@@ -1,0 +1,90 @@
+name: Squash merge when reviewed
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, synchronize, ready_for_review, reopened]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+# Queue, do not cancel: a later merge run must not abort drop-stale-review.
+concurrency:
+  group: squash-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  drop-stale-review:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove review-passed after new commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/review-passed" || true
+
+  merge:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.action != 'synchronize' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge if reviewed and unit is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          number="${PR_NUMBER:-}"
+          if [ -z "$number" ]; then
+            number="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[0].number // empty')"
+          fi
+          [ -n "${number:-}" ] || { echo "no open PR"; exit 0; }
+
+          meta="$(gh pr view "$number" --repo "$REPO" --json isDraft,mergeable,labels,state,headRefOid,statusCheckRollup)"
+          echo "$meta"
+          current="$(echo "$meta" | jq -r '.headRefOid')"
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "stale event head ${HEAD_SHA} != current ${current}"
+            exit 0
+          fi
+          if ! echo "$meta" | jq -e '.state == "OPEN" and .isDraft == false and .mergeable == "MERGEABLE"' >/dev/null; then
+            echo "PR is not ready to merge"
+            exit 0
+          fi
+          if ! echo "$meta" | jq -e '[.labels[].name] | index("review-passed")' >/dev/null; then
+            echo "review-passed label missing"
+            exit 0
+          fi
+
+          pending="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit") | select(.status=="QUEUED" or .status=="IN_PROGRESS" or .status=="PENDING")] | length')"
+          echo "unit_pending=$pending"
+          if [ "$pending" != "0" ]; then
+            echo "unit is still running"
+            exit 0
+          fi
+          unit="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit") | select(.conclusion != "CANCELLED") | select(.conclusion != "SKIPPED")] | sort_by(.completedAt) | last | .conclusion // empty')"
+          echo "unit=$unit"
+          if [ "$unit" != "SUCCESS" ]; then
+            echo "unit is not green"
+            exit 0
+          fi
+
+          gh pr merge "$number" --repo "$REPO" --squash --delete-branch
