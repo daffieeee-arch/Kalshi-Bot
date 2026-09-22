@@ -36,6 +36,9 @@ _MONTHS = {
     "DEC": 12,
 }
 _TICKER_PREFIX = "KXBTC15M-"
+_DISCOVER_INTERVAL_S = 15.0
+
+
 def _is_snapshot_line(line: bytes) -> bool:
     return b'"stream":"orderbook_snapshot"' in line or b'"stream": "orderbook_snapshot"' in line
 _LOOKBACK_BYTES = None
@@ -132,11 +135,12 @@ class LiveFeed:
             yes_ask = self.book.implied_ask("yes")
             no_ask = self.book.implied_ask("no")
             ticker = self.book.market_ticker or self._market.get("ticker")
+            market = self._market_for(ticker)
             close_at = parse_kxbtc15m_close(str(ticker)) if ticker else None
             seconds_left = None
             if close_at is not None:
                 seconds_left = (close_at - datetime.now(timezone.utc)).total_seconds()
-            strike = self._market.get("floor_strike")
+            strike = market.get("floor_strike")
             spot = self._brti.get("value")
             close_avg = self._brti.get("close_avg")
             close_window = self._brti.get("close_window")
@@ -156,8 +160,8 @@ class LiveFeed:
                 "error": self._error,
                 "ticker": ticker,
                 "close_at": close_at.isoformat() if close_at else None,
-                "floor_strike": self._market.get("floor_strike"),
-                "title": self._market.get("title"),
+                "floor_strike": market.get("floor_strike"),
+                "title": market.get("title"),
                 "book": {
                     "valid": self.book.valid,
                     "yes": _levels(self.book.yes, reverse=True),
@@ -230,10 +234,12 @@ class LiveFeed:
             if stream == "orderbook_snapshot":
                 if self.book.apply_snapshot(payload).ok:
                     self._book_status = "live"
+                    self._forget_stale_market()
             elif stream == "orderbook_delta":
                 result = self.book.apply_delta(payload)
                 if result.ok:
                     self._book_status = "live"
+                    self._forget_stale_market()
                 elif result.need_snapshot:
                     self._book_status = "need_snapshot"
             elif stream == "trade":
@@ -257,25 +263,55 @@ class LiveFeed:
                     self._brti["value"] = current
                     self._brti["ts_ms"] = row.get("ts_ms") or msg.get("received_at")
 
+    def _market_for(self, ticker: str | None) -> dict[str, Any]:
+        if ticker and self._market.get("ticker") == ticker:
+            return self._market
+        return {}
+
+    def _forget_stale_market(self) -> None:
+        ticker = self.book.market_ticker
+        if not ticker or self._market.get("ticker") in (None, ticker):
+            return
+        self._market = {}
+        self._last_discover = 0.0
+
     def _maybe_discover(self) -> None:
         if self.settings is None or not self.settings.has_prod_credentials:
             return
         now = time.monotonic()
-        if now - self._last_discover < 15.0:
+        wanted = self.book.market_ticker
+        stale = bool(wanted and self._market.get("ticker") not in (None, wanted))
+        if not stale and now - self._last_discover < _DISCOVER_INTERVAL_S:
             return
         self._last_discover = now
         try:
             with KalshiReadClient(self.settings) as rest:
-                raw = rest.get_markets(series_ticker=SERIES_TICKER_BTC_15M, status="open", limit=50)
+                summary = self._discover_summary(rest, wanted)
         except Exception:
             return
+        if summary is None:
+            return
+        with self._lock:
+            book_ticker = self.book.market_ticker
+            if book_ticker and summary.get("ticker") != book_ticker:
+                return
+            self._market = summary
+
+    def _discover_summary(self, rest: KalshiReadClient, wanted: str | None) -> dict[str, Any] | None:
+        if wanted:
+            raw_one = rest.get_market(wanted)
+            market = raw_one.get("market") if isinstance(raw_one, dict) else None
+            if not isinstance(market, dict):
+                market = raw_one if isinstance(raw_one, dict) else None
+            if not market or not market.get("ticker"):
+                return None
+            return summarize_market(market)
+        raw = rest.get_markets(series_ticker=SERIES_TICKER_BTC_15M, status="open", limit=50)
         open_markets = [m for m in (raw.get("markets") or []) if is_currently_open(m)]
         open_markets.sort(key=lambda m: m.get("close_time") or "")
         if not open_markets:
-            return
-        summary = summarize_market(open_markets[0])
-        with self._lock:
-            self._market = summary
+            return None
+        return summarize_market(open_markets[0])
 
     def _recorder_status(self) -> dict[str, Any]:
         pid = _lock_pid(self.lock_path)
