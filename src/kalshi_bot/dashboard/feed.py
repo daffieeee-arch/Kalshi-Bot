@@ -11,31 +11,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
-from kalshi_bot.discover import is_currently_open, summarize_market
+from kalshi_bot.discover import is_currently_open, parse_kxbtc15m_close, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
 from kalshi_bot.signal import evaluate, realized_sigma, signal_to_dict
 
-_NY = ZoneInfo("America/New_York")
-_MONTHS = {
-    "JAN": 1,
-    "FEB": 2,
-    "MAR": 3,
-    "APR": 4,
-    "MAY": 5,
-    "JUN": 6,
-    "JUL": 7,
-    "AUG": 8,
-    "SEP": 9,
-    "OCT": 10,
-    "NOV": 11,
-    "DEC": 12,
-}
-_TICKER_PREFIX = "KXBTC15M-"
 _DISCOVER_INTERVAL_S = 15.0
 
 
@@ -54,25 +37,8 @@ STREAM_LABELS = {
     "trade": "tape",
     "subscribed": "subscribe ack",
     "ok": "command ack",
+    "market_meta": "market roll",
 }
-
-
-def parse_kxbtc15m_close(ticker: str) -> datetime | None:
-    """Parse KXBTC15M-26SEP221015-15 as 2026-09-22 10:15 America/New_York."""
-    if not ticker.startswith(_TICKER_PREFIX):
-        return None
-    body = ticker[len(_TICKER_PREFIX) :]
-    stamp, sep, _suffix = body.partition("-")
-    if not sep or len(stamp) != 11:
-        return None
-    year = 2000 + int(stamp[0:2])
-    month = _MONTHS.get(stamp[2:5])
-    if month is None:
-        return None
-    day = int(stamp[5:7])
-    hour = int(stamp[7:9])
-    minute = int(stamp[9:11])
-    return datetime(year, month, day, hour, minute, tzinfo=_NY)
 
 
 def _levels(book: dict[Decimal, Decimal], *, reverse: bool) -> list[list[str]]:

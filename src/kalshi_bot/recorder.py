@@ -111,27 +111,37 @@ class Recorder:
         ws = ProductionWebSocket(self.settings)
         await ws.connect()
         try:
-            await self._subscribe(ws, market)
+            await self._subscribe(ws, market, writer)
             async for message in ws.messages():
                 if self._stop.is_set() or self._expired(started):
                     break
                 await self._handle(message, ws, writer)
-                await self._maybe_discover(ws, rest)
+                await self._maybe_discover(ws, rest, writer)
         finally:
             self.book.reset()
             self.subs = Subscriptions()
             await ws.close()
 
-    async def _maybe_discover(self, ws: ProductionWebSocket, rest: KalshiReadClient) -> None:
+    async def _maybe_discover(
+        self,
+        ws: ProductionWebSocket,
+        rest: KalshiReadClient,
+        writer: JsonlWriter | None = None,
+    ) -> None:
         now = asyncio.get_running_loop().time()
         if now - self._last_discover < DISCOVER_INTERVAL_S:
             return
         self._last_discover = now
         nxt = _open_market(rest)
         if nxt and nxt.get("ticker") != self.ticker:
-            await self._roll(ws, str(nxt["ticker"]), nxt.get("floor_strike"))
+            await self._roll(ws, str(nxt["ticker"]), nxt.get("floor_strike"), writer)
 
-    async def _subscribe(self, ws: ProductionWebSocket, market: dict[str, Any] | None) -> None:
+    async def _subscribe(
+        self,
+        ws: ProductionWebSocket,
+        market: dict[str, Any] | None,
+        writer: JsonlWriter | None = None,
+    ) -> None:
         self.ticker = None
         self.floor_strike = None
         if market:
@@ -141,6 +151,7 @@ class Recorder:
             for intent in self.paper.intents:
                 if not intent.market_ticker:
                     intent.market_ticker = self.ticker
+        self._write_market_meta(writer)
         await ws.subscribe(channels=["cfbenchmarks_value"], index_ids=[BRTI_INDEX_ID])
         await ws.subscribe(channels=["cfbenchmarks_value_5hz"], index_ids=[BRTI_INDEX_ID])
         if self.ticker:
@@ -210,7 +221,25 @@ class Recorder:
         elif channel == "cfbenchmarks_value_5hz":
             self.subs.brti_5hz = value
 
-    async def _roll(self, ws: ProductionWebSocket, ticker: str, floor_strike: Any) -> None:
+    def _write_market_meta(self, writer: JsonlWriter | None) -> None:
+        if writer is None or self.ticker is None:
+            return
+        writer.write(
+            {
+                "ticker": self.ticker,
+                "floor_strike": format(self.floor_strike, "f") if self.floor_strike is not None else None,
+            },
+            stream="market_meta",
+            ts_ms=None,
+        )
+
+    async def _roll(
+        self,
+        ws: ProductionWebSocket,
+        ticker: str,
+        floor_strike: Any,
+        writer: JsonlWriter | None = None,
+    ) -> None:
         old = self.ticker
         if self.subs.orderbook is not None and old:
             await ws.update_subscription(
@@ -242,6 +271,7 @@ class Recorder:
         self._remember_closed_window()
         self.ticker = ticker
         self.floor_strike = Decimal(str(floor_strike)) if floor_strike is not None else None
+        self._write_market_meta(writer)
         log.info("rolled to %s", ticker)
 
     def _remember_closed_window(self, *, now: float | None = None) -> None:
