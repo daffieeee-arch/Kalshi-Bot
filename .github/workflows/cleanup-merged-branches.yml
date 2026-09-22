@@ -1,0 +1,39 @@
+name: Cleanup merged branches
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Delete remote branches already merged into main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --prune origin
+          deleted=0
+          while read -r ref; do
+            [ -z "$ref" ] && continue
+            branch="${ref#origin/}"
+            case "$branch" in
+              main|HEAD) continue ;;
+            esac
+            if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qx 0; then
+              echo "deleting merged branch $branch"
+              git push origin --delete "$branch"
+              deleted=$((deleted + 1))
+            else
+              echo "keeping $branch (open PR)"
+            fi
+          done < <(git branch -r --merged origin/main | sed 's/^ *//')
+          echo "deleted=$deleted"

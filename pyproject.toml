@@ -29,3 +29,4 @@ pythonpath = ["src"]
 markers = [
   "integration: hits the live Kalshi DEMO public API",
 ]
+addopts = "-q"

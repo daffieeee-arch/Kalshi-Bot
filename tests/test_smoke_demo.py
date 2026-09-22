@@ -9,8 +9,6 @@ from kalshi_bot.client import KalshiDemoClient
 from kalshi_bot.config import DEMO_REST_BASE, DEMO_WS_URL, SERIES_TICKER_BTC_15M, load_settings
 from kalshi_bot.discover import discover_btc_15m, is_currently_open, summarize_market
 
-pytestmark = pytest.mark.integration
-
 
 def test_settings_are_demo_only() -> None:
     settings = load_settings()
@@ -28,6 +26,7 @@ def test_signing_path_strips_query() -> None:
     )
 
 
+@pytest.mark.integration
 def test_discover_open_kxbtc15m_on_demo() -> None:
     settings = load_settings()
     with KalshiDemoClient(settings) as client:

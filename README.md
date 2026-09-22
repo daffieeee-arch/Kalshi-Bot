@@ -80,10 +80,26 @@ If credentials are present, the CLI also prints demo portfolio balance. If not, 
 ## Smoke test
 
 ```bash
-pytest -q
+pytest -m "not integration"
+pytest -m integration
 ```
 
-Hits the live DEMO public API (series + markets). Signing is covered with an ephemeral RSA key (no secrets required).
+Unit tests cover signing and the demo lock. The integration mark hits the live DEMO public API (series + markets).
+
+## Development flow
+
+Work stays off `main`. One change set per branch, then a PR.
+
+1. Branch from latest `main` (`feature/…` or `cursor/…`).
+2. Open a **draft** PR when the change is reviewable.
+3. CI runs two jobs: `unit` (required quality bar) and `demo-api` (live Kalshi demo; can flake if the demo host is down).
+4. Review the diff. Fix real comments, dismiss noise, push to the same branch. `/autopilot` in Cursor does that loop; it does not merge.
+5. **Squash and merge** when `unit` is green. Merge commits and rebases are disabled.
+6. GitHub deletes the head branch after merge. A weekly workflow also deletes leftover remote branches that are already merged into `main` and have no open PR.
+
+Do not push demo keys, `.env`, or `keys/*.key`. This is a private repo on GitHub Free: branch-protection rulesets are not available, so `main` is guarded by habit and CI, not a required-review lock.
+
+This repo is a single-developer project. A required approval would only block you from merging your own work. Review is still a step; it is not a GitHub gate.
 
 ## Auth model
 
