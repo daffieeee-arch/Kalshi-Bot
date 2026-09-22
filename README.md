@@ -104,7 +104,13 @@ Local interactive dashboard over that capture (does not place orders):
 dashboard-btc-15m
 ```
 
-Open [http://127.0.0.1:8787](http://127.0.0.1:8787). The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown. Pause, depth, and tape filters stay in the browser.
+On this host: [http://127.0.0.1:8787](http://127.0.0.1:8787).
+
+On any machine in the Tailscale tailnet (Mac, phone, …):
+[https://chupa.tail9f5972.ts.net:8443](https://chupa.tail9f5972.ts.net:8443)
+(tailnet only; the existing `https://chupa.tail9f5972.ts.net/` app on :443 is unchanged).
+
+The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown. Pause, depth, and tape filters stay in the browser.
 
 If credentials are present, the CLI also prints demo portfolio balance. If not, it prints setup steps and still completes public discover.
 
