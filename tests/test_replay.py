@@ -155,6 +155,35 @@ def test_replay_ignores_midwindow_hint(tmp_path: Path) -> None:
     assert report.traded == []
 
 
+def test_replay_settles_previous_window_after_roll(tmp_path: Path) -> None:
+    t1 = "KXBTC15M-26SEP221015-15"
+    t2 = "KXBTC15M-26SEP221030-30"
+    ts_last = _ts(10, 14, 10)
+    ts_roll = _ts(10, 15, 0)
+    jsonl = tmp_path / "cap.jsonl"
+    _write(
+        jsonl,
+        [
+            _row("orderbook_snapshot", _snapshot(market_ticker=t1), ts_last),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 10, ts_last), ts_last),
+            _row("orderbook_snapshot", _snapshot(market_ticker=t2), ts_roll),
+            _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_roll), ts_roll),
+        ],
+    )
+    markets = {
+        t1: MarketInfo(t1, Decimal("85000"), "yes", "finalized"),
+        t2: MarketInfo(t2, Decimal("86000"), None, "active"),
+    }
+    report = replay(jsonl, markets)
+    first = next(row for row in report.windows if row.ticker == t1)
+    second = next(row for row in report.windows if row.ticker == t2)
+    assert first.side == "yes"
+    assert first.pnl is not None and first.pnl > 0
+    assert first.yes_won is True
+    assert second.pnl is None
+    assert second.yes_won is None
+
+
 def test_replay_reads_strike_from_market_meta(tmp_path: Path) -> None:
     ts_open = _ts(10, 14, 10)
     ts_close = _ts(10, 15, 0)

@@ -14,7 +14,10 @@ from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.discover import parse_kxbtc15m_close
 from kalshi_bot.orderbook import OrderbookState, Side
 from kalshi_bot.paper import PaperIntent, PaperLedger
+from kalshi_bot.recorder import SETTLE_PENDING_S
 from kalshi_bot.signal import evaluate, realized_sigma
+
+_SETTLE_PENDING_MS = int(SETTLE_PENDING_S * 1000)
 
 _SKIP_STREAMS = frozenset(
     {"trade", "cfbenchmarks_value_5hz", "subscribed", "ok", "unknown"}
@@ -161,13 +164,69 @@ def fetch_markets(rest: KalshiReadClient, tickers: list[str]) -> dict[str, Marke
     return out
 
 
+class _Replay:
+    """Keep the just-rolled window until its BRTI close tick arrives."""
+
+    def __init__(self, markets: Mapping[str, MarketInfo]) -> None:
+        self.markets = markets
+        self.current: _Window | None = None
+        self.pending: _Window | None = None
+        self.pending_until_ms: int | None = None
+        self.report = ReplayReport()
+
+    def roll(self, ticker: str, ts_ms: Any) -> _Window:
+        if self.current is not None and self.current.ticker == ticker:
+            return self.current
+        if self.pending is not None:
+            self.report.windows.append(_finish(self.pending))
+            self.pending = None
+            self.pending_until_ms = None
+        if self.current is not None:
+            if self.current.settled:
+                self.report.windows.append(_finish(self.current))
+            else:
+                self.pending = self.current
+                self.pending_until_ms = int(ts_ms) + _SETTLE_PENDING_MS if ts_ms is not None else None
+        self.current = _Window(ticker, self.markets.get(ticker))
+        return self.current
+
+    def on_brti(self, msg: dict[str, Any], ts_ms: Any) -> None:
+        self._expire_pending(ts_ms)
+        close_n = _close_window(msg)
+        if self.pending is not None:
+            _on_brti(self.pending, msg, ts_ms)
+            if self.pending.settled:
+                self.report.windows.append(_finish(self.pending))
+                self.pending = None
+                self.pending_until_ms = None
+            if close_n is not None and close_n >= 60:
+                return
+        if self.current is not None:
+            _on_brti(self.current, msg, ts_ms)
+
+    def finish(self) -> ReplayReport:
+        if self.pending is not None:
+            self.report.windows.append(_finish(self.pending))
+        if self.current is not None:
+            self.report.windows.append(_finish(self.current))
+        return self.report
+
+    def _expire_pending(self, ts_ms: Any) -> None:
+        if self.pending is None or self.pending_until_ms is None or ts_ms is None:
+            return
+        if int(ts_ms) <= self.pending_until_ms:
+            return
+        self.report.windows.append(_finish(self.pending))
+        self.pending = None
+        self.pending_until_ms = None
+
+
 def replay(
     path: Path,
     markets: Mapping[str, MarketInfo],
 ) -> ReplayReport:
     """Stream one JSONL capture and apply the live last-minute paper hint."""
-    current: _Window | None = None
-    report = ReplayReport()
+    state = _Replay(markets)
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stream = _stream_name(line)
@@ -178,40 +237,25 @@ def replay(
             if stream in _SKIP_STREAMS:
                 continue
             payload = row.get("payload") or {}
+            ts_ms = row.get("ts_ms")
             if stream == "market_meta":
-                current = _roll(current, report, str(payload.get("ticker") or ""), markets)
+                current = state.roll(str(payload.get("ticker") or ""), ts_ms)
                 _apply_meta(current, payload, markets)
                 continue
             if stream == "orderbook_snapshot":
                 ticker = (payload.get("msg") or {}).get("market_ticker")
                 if ticker:
-                    current = _roll(current, report, str(ticker), markets)
-                if current is not None:
-                    current.book.apply_snapshot(payload)
+                    state.roll(str(ticker), ts_ms)
+                if state.current is not None:
+                    state.current.book.apply_snapshot(payload)
                 continue
             if stream == "orderbook_delta":
-                if current is not None:
-                    current.book.apply_delta(payload)
+                if state.current is not None:
+                    state.current.book.apply_delta(payload)
                 continue
             if stream == "cfbenchmarks_value":
-                if current is not None:
-                    _on_brti(current, payload.get("msg") or {}, row.get("ts_ms"))
-    if current is not None:
-        report.windows.append(_finish(current))
-    return report
-
-
-def _roll(
-    current: _Window | None,
-    report: ReplayReport,
-    ticker: str,
-    markets: Mapping[str, MarketInfo],
-) -> _Window:
-    if current is not None and current.ticker == ticker:
-        return current
-    if current is not None:
-        report.windows.append(_finish(current))
-    return _Window(ticker, markets.get(ticker))
+                state.on_brti(payload.get("msg") or {}, ts_ms)
+    return state.finish()
 
 
 def _apply_meta(window: _Window, payload: dict[str, Any], markets: Mapping[str, MarketInfo]) -> None:
@@ -240,7 +284,9 @@ def _on_brti(window: _Window, msg: dict[str, Any], ts_ms: Any) -> None:
         window.close_window = int(view["close_window"])
     seconds_left = _seconds_left(window, ts_ms)
     if window.close_window is not None and window.close_window >= 60:
-        _settle(window)
+        left = seconds_left
+        if left is None or left <= 5:
+            _settle(window)
         return
     if (
         window.decision is None
@@ -385,6 +431,14 @@ def _yes_won(
         return close_avg >= strike
     unreachable: Never = result
     raise ValueError(f"unknown result {unreachable!r}")
+
+
+def _close_window(msg: dict[str, Any]) -> int | None:
+    close = msg.get("last_60s_windowed_average_15min") or {}
+    raw = close.get("window_size")
+    if raw is None:
+        return None
+    return int(raw)
 
 
 def _seconds_left(window: _Window, ts_ms: Any) -> float | None:
