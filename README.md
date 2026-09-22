@@ -91,12 +91,13 @@ Unit tests cover signing and the demo lock. The integration mark hits the live D
 Work stays off `main`. One change set per branch, then a PR. CI and review run **in parallel**; squash-merge waits for both.
 
 1. Branch from latest `main` (`feature/…` or `cursor/…`).
-2. Open a PR. Mark it **ready** when you want the merge gate to apply. Drafts never auto-merge.
+2. Open a PR, draft is fine. Put `wip` on it if it must stay draft after CI.
 3. CI starts immediately: `unit` (merge gate) and `demo-api` (live Kalshi demo; advisory).
-4. An independent review (a second Cursor agent that only reads the diff, not Bugbot) looks for blocking bugs only. Nits do not block. Do not use paid Bugbot.
-5. Findings: the authoring agent fixes and pushes. A new push **drops** the `review-passed` label, so review must run again. Stop after two review rounds unless a finding is still merge-blocking.
-6. No blocking findings: add the `review-passed` label.
-7. When the PR is ready, has `review-passed`, is mergeable, and `unit` is green, GitHub **squash-merges** and deletes the head branch.
+4. When `unit` is green and there is no `wip` label, CI marks the PR **ready**. Drafts with `wip` never auto-ready or auto-merge.
+5. Independent Bugbot review (read-only). GitHub Actions cannot start Cursor Bugbot; run `/review-bugbot` on the ready PR. Nits do not block.
+6. Findings: the authoring agent fixes and pushes. A new push **drops** the `review-passed` label, so review must run again. Stop after two review rounds unless a finding is still merge-blocking.
+7. No blocking findings: add the `review-passed` label.
+8. Ready + `review-passed` + mergeable + green `unit` → squash-merge and delete the head branch.
 
 Do not skip the label. With zero required human approvals, a green `unit` check alone would otherwise merge without a review. `/autopilot` still only fixes comments and CI; it does not merge.
 

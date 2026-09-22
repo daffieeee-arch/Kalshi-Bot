@@ -1,10 +1,12 @@
 ---
-description: Never use paid Bugbot; review with a second Cursor agent instead
+description: Bugbot is reviewer-only; it must not write code or merge
 alwaysApply: true
 ---
 
-# No Bugbot
+# Bugbot is reviewer-only
 
-Do not run `/review-bugbot`, the `bugbot` subagent, or any paid Bugbot GitHub app. Chupa will not pay for Bugbot.
+Bugbot may run as a free, read-only reviewer when Chupa asks or when CI has just gone green on a ready PR. It must not write code, push, apply labels, or merge.
 
-Independent review on a PR is a second Cursor agent that only reads the diff and reports blocking bugs. That agent does not write code, push, or merge. The authoring agent may fix findings afterward. Add `review-passed` only after that review finds no blocking issues.
+Do not start paid Bugbot products or the Bugbot GitHub app billing flow.
+
+After a clean Bugbot review, the authoring agent (not Bugbot) may add `review-passed`. Findings are fixed by the authoring agent, then reviewed again.

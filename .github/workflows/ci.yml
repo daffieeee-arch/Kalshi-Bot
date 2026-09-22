@@ -34,3 +34,34 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Live DEMO public API
         run: pytest -m integration
+
+  mark-ready:
+    name: mark-ready
+    needs: unit
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Mark the PR ready after green unit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          labels="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name]')"
+          if echo "$labels" | jq -e 'index("wip")' >/dev/null; then
+            echo "wip label present; leave draft"
+            exit 0
+          fi
+          gh pr ready "$PR_NUMBER" --repo "$REPO"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<'EOF'
+          `unit` is green, so this draft is now ready.
+
+          Next: independent Bugbot review (read-only). GitHub Actions cannot start Cursor Bugbot. After a clean review, add `review-passed` to squash-merge.
+          EOF
+          )"
