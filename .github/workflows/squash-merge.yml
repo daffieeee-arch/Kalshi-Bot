@@ -1,0 +1,60 @@
+name: Squash merge when reviewed
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, synchronize, ready_for_review, reopened]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: squash-merge-${{ github.event.pull_request.number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  drop-stale-review:
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove review-passed after new commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/review-passed" || true
+
+  merge:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.action != 'synchronize' &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge if reviewed and unit is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            number="${{ github.event.pull_request.number }}"
+          else
+            number="$(gh pr list --repo "$repo" --head "${{ github.event.workflow_run.head_branch }}" --state open --json number --jq '.[0].number // empty')"
+          fi
+          [ -n "${number:-}" ] || { echo "no open PR"; exit 0; }
+
+          meta="$(gh pr view "$number" --repo "$repo" --json isDraft,mergeable,labels,state)"
+          echo "$meta"
+          echo "$meta" | jq -e '.state == "OPEN" and .isDraft == false and .mergeable == "MERGEABLE"' >/dev/null
+          echo "$meta" | jq -e '[.labels[].name] | index("review-passed")' >/dev/null
+
+          unit="$(gh pr checks "$number" --repo "$repo" --json name,state,conclusion --jq '.[] | select(.name=="unit") | .conclusion' | head -n1)"
+          echo "unit=$unit"
+          [ "$unit" = "SUCCESS" ]
+
+          gh pr merge "$number" --repo "$repo" --squash --delete-branch

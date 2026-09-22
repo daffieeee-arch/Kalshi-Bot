@@ -88,16 +88,19 @@ Unit tests cover signing and the demo lock. The integration mark hits the live D
 
 ## Development flow
 
-Work stays off `main`. One change set per branch, then a PR.
+Work stays off `main`. One change set per branch, then a PR. CI and review run **in parallel**; squash-merge waits for both.
 
 1. Branch from latest `main` (`feature/…` or `cursor/…`).
-2. Open a **draft** PR when the change is reviewable.
-3. CI runs two jobs: `unit` (required quality bar) and `demo-api` (live Kalshi demo; can flake if the demo host is down).
-4. Review the diff. Fix real comments, dismiss noise, push to the same branch. `/autopilot` in Cursor does that loop; it does not merge.
-5. **Squash and merge** when `unit` is green. Merge commits and rebases are disabled.
-6. GitHub deletes the head branch after merge. A weekly workflow also deletes leftover remote branches that are already merged into `main` and have no open PR.
+2. Open a PR. Mark it **ready** when you want the merge gate to apply. Drafts never auto-merge.
+3. CI starts immediately: `unit` (merge gate) and `demo-api` (live Kalshi demo; advisory).
+4. An independent review (Cursor `/review-bugbot`, not the authoring agent) looks for blocking bugs only. Nits do not block.
+5. Findings: the authoring agent fixes and pushes. A new push **drops** the `review-passed` label, so review must run again. Stop after two review rounds unless a finding is still merge-blocking.
+6. No blocking findings: add the `review-passed` label.
+7. When the PR is ready, has `review-passed`, is mergeable, and `unit` is green, GitHub **squash-merges** and deletes the head branch.
 
-Do not push demo keys, `.env`, or `keys/*.key`. The repo is public: secret scanning and push protection are on, and `main` requires a PR plus a green `unit` check. Admins can bypass in an emergency. Review is still a step; it is not a required approval.
+Do not skip the label. With zero required human approvals, a green `unit` check alone would otherwise merge without a review. `/autopilot` still only fixes comments and CI; it does not merge.
+
+Keep secrets, production unlocks, and “should we trade this” questions for a human. Do not push demo keys, `.env`, or `keys/*.key`. `main` still requires a PR plus `unit`. Admins can bypass the ruleset in an emergency.
 
 ## Auth model
 
