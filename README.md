@@ -97,9 +97,7 @@ Work stays off `main`. One change set per branch, then a PR.
 5. **Squash and merge** when `unit` is green. Merge commits and rebases are disabled.
 6. GitHub deletes the head branch after merge. A weekly workflow also deletes leftover remote branches that are already merged into `main` and have no open PR.
 
-Do not push demo keys, `.env`, or `keys/*.key`. This is a private repo on GitHub Free: branch-protection rulesets are not available, so `main` is guarded by habit and CI, not a required-review lock.
-
-This repo is a single-developer project. A required approval would only block you from merging your own work. Review is still a step; it is not a GitHub gate.
+Do not push demo keys, `.env`, or `keys/*.key`. The repo is public: secret scanning and push protection are on, and `main` requires a PR plus a green `unit` check. Admins can bypass in an emergency. Review is still a step; it is not a required approval.
 
 ## Auth model
 
