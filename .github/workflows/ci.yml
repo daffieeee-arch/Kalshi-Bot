@@ -68,10 +68,22 @@ jobs:
             echo "wip label present; leave draft"
             exit 0
           fi
-          gh pr ready "$PR_NUMBER" --repo "$REPO"
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<'EOF'
+          # GITHUB_TOKEN cannot markPullRequestReadyForReview (GraphQL 403).
+          # Do not fail CI: unit is the merge gate. The authoring agent runs `gh pr ready`.
+          if gh pr ready "$PR_NUMBER" --repo "$REPO"; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<'EOF'
           `unit` is green, so this draft is now ready.
 
           Next: independent Bugbot review (read-only). GitHub Actions cannot start Cursor Bugbot. After a clean review, add `review-passed` to squash-merge.
           EOF
           )"
+            exit 0
+          fi
+          echo "Actions cannot mark the PR ready; leaving a comment instead."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<'EOF'
+          `unit` is green. GitHub Actions cannot mark a draft ready (`GITHUB_TOKEN`).
+
+          Next: `gh pr ready`, then independent Bugbot review (read-only). After a clean review, add `review-passed` to squash-merge.
+          EOF
+          )" || true
+          exit 0
