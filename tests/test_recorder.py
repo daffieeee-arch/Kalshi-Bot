@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from kalshi_bot.config import load_settings
 from kalshi_bot.paper import PaperIntent, PaperLedger
+from kalshi_bot.record import JsonlWriter
 from kalshi_bot.recorder import DISCOVER_INTERVAL_S, SETTLE_PENDING_S, Recorder
 
 
@@ -98,6 +100,21 @@ def test_incomplete_window_does_not_settle(tmp_path: Path) -> None:
     rec.floor_strike = Decimal("100")
     rec._maybe_settle(_close_avg("150", window_size=14))
     assert rec.paper.intents[0].settled is False
+
+
+def test_write_market_meta_records_strike(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    rec.ticker = "KXBTC15M-TEST"
+    rec.floor_strike = Decimal("86000")
+    writer = JsonlWriter(tmp_path / "meta.jsonl")
+    try:
+        rec._write_market_meta(writer)
+    finally:
+        writer.close()
+    row = json.loads((tmp_path / "meta.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["stream"] == "market_meta"
+    assert row["payload"]["ticker"] == "KXBTC15M-TEST"
+    assert row["payload"]["floor_strike"] == "86000"
 
 
 def test_discover_throttled_when_ticker_missing(tmp_path: Path) -> None:

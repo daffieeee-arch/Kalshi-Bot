@@ -8,15 +8,17 @@ import json
 import logging
 import sys
 from decimal import Decimal
+from pathlib import Path
 
 import uvicorn
 
-from kalshi_bot.client import KalshiDemoClient
+from kalshi_bot.client import KalshiDemoClient, KalshiReadClient
 from kalshi_bot.config import SERIES_TICKER_BTC_15M, load_settings, require_prod_credentials
 from kalshi_bot.dashboard.app import create_app
 from kalshi_bot.discover import discover_btc_15m, format_market_line
 from kalshi_bot.paper import PaperIntent
-from kalshi_bot.recorder import run_recorder
+from kalshi_bot.recorder import DEFAULT_JSONL, run_recorder
+from kalshi_bot.replay import collect_tickers, fetch_markets, replay
 
 
 CREDENTIALS_HELP = """
@@ -145,6 +147,48 @@ def dashboard_main(argv: list[str] | None = None) -> None:
     parser = build_dashboard_parser()
     args = parser.parse_args(argv)
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
+
+
+def build_replay_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="replay-btc-15m",
+        description="Replay last-minute paper hints on a production KXBTC15M JSONL capture.",
+    )
+    parser.add_argument("--path", default=str(DEFAULT_JSONL), help="JSONL capture path")
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON")
+    return parser
+
+
+def cmd_replay_btc_15m(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    if not path.is_file():
+        print(f"capture not found: {path}", file=sys.stderr)
+        return 1
+    settings = require_prod_credentials(load_settings())
+    tickers = collect_tickers(path)
+    with KalshiReadClient(settings) as rest:
+        markets = fetch_markets(rest, tickers)
+    report = replay(path, markets)
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(f"windows: {payload['windows']}  traded: {payload['traded']}  "
+          f"wins: {payload['wins']}  losses: {payload['losses']}  waits: {payload['waits']}")
+    print(f"pnl: {payload['pnl']}  avg_pnl: {payload['avg_pnl']}")
+    print()
+    for row in payload["rows"]:
+        mark = row["skip"] or row["side"] or "?"
+        pnl = row["pnl"] if row["pnl"] is not None else "-"
+        print(f"{row['ticker']}  {mark}  pnl={pnl}  "
+              f"result={row['official_result']}  n={row['n']}  edge={row['edge']}")
+    return 0
+
+
+def replay_main(argv: list[str] | None = None) -> None:
+    parser = build_replay_parser()
+    args = parser.parse_args(argv)
+    raise SystemExit(cmd_replay_btc_15m(args))
 
 
 if __name__ == "__main__":

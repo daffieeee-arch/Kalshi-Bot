@@ -42,8 +42,9 @@ src/kalshi_bot/
   paper.py       # local paper ledger
   fees.py        # quadratic taker fee
   discover.py    # KXBTC15M open-market discovery
-  cli.py         # discover-btc-15m + record-btc-15m + dashboard-btc-15m
+  cli.py         # discover-btc-15m + record-btc-15m + dashboard-btc-15m + replay-btc-15m
   dashboard/     # local live overview of the JSONL capture
+  replay.py      # last-minute paper hint vs settlement on a JSONL capture
 ```
 
 ## Setup
@@ -112,6 +113,15 @@ On any machine in the Tailscale tailnet (Mac, phone, …):
 
 The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders.
 
+Replay the last-minute paper hint against official settlements (local report, no orders):
+
+```bash
+replay-btc-15m
+replay-btc-15m --json
+```
+
+Private delivery board (not public issues): [Kalshi KXBTC15M — Roadmap](https://github.com/users/daffieeee-arch/projects/5). After each shipped step the authoring agent updates that board.
+
 If credentials are present, the CLI also prints demo portfolio balance. If not, it prints setup steps and still completes public discover.
 
 ## Smoke test
@@ -135,6 +145,7 @@ Work stays off `main`. One change set per branch, then a PR. CI and review run *
 6. Findings: the authoring agent fixes and pushes. A new push **drops** the `review-passed` label, so review must run again. Stop after two review rounds unless a finding is still merge-blocking.
 7. No blocking findings: add the `review-passed` label.
 8. Ready + `review-passed` + mergeable + green `unit` → squash-merge and delete the head branch.
+9. Update the private GitHub Project: move Now/Next/Later/Done, rewrite the item with the result, add a card only when the plan changed. Do not open public issues for the hypothesis.
 
 Do not skip the label. With zero required human approvals, a green `unit` check alone would otherwise merge without a review. `/autopilot` still only fixes comments and CI; it does not merge.
 
