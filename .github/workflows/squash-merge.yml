@@ -39,7 +39,6 @@ jobs:
        github.event.pull_request.draft == false &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
@@ -74,7 +73,13 @@ jobs:
             exit 0
           fi
 
-          unit="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit")] | last | .conclusion')"
+          pending="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit") | select(.status=="QUEUED" or .status=="IN_PROGRESS" or .status=="PENDING")] | length')"
+          echo "unit_pending=$pending"
+          if [ "$pending" != "0" ]; then
+            echo "unit is still running"
+            exit 0
+          fi
+          unit="$(echo "$meta" | jq -r '[.statusCheckRollup[] | select(.name=="unit") | select(.conclusion != "CANCELLED") | select(.conclusion != "SKIPPED")] | sort_by(.completedAt) | last | .conclusion // empty')"
           echo "unit=$unit"
           if [ "$unit" != "SUCCESS" ]; then
             echo "unit is not green"
