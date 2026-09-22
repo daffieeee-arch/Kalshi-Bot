@@ -1,0 +1,10 @@
+---
+description: Never use paid Bugbot; review with a second Cursor agent instead
+alwaysApply: true
+---
+
+# No Bugbot
+
+Do not run `/review-bugbot`, the `bugbot` subagent, or any paid Bugbot GitHub app. Chupa will not pay for Bugbot.
+
+Independent review on a PR is a second Cursor agent that only reads the diff and reports blocking bugs. That agent does not write code, push, or merge. The authoring agent may fix findings afterward. Add `review-passed` only after that review finds no blocking issues.

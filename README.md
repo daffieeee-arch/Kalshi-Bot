@@ -93,7 +93,7 @@ Work stays off `main`. One change set per branch, then a PR. CI and review run *
 1. Branch from latest `main` (`feature/…` or `cursor/…`).
 2. Open a PR. Mark it **ready** when you want the merge gate to apply. Drafts never auto-merge.
 3. CI starts immediately: `unit` (merge gate) and `demo-api` (live Kalshi demo; advisory).
-4. An independent review (Cursor `/review-bugbot`, not the authoring agent) looks for blocking bugs only. Nits do not block.
+4. An independent review (a second Cursor agent that only reads the diff, not Bugbot) looks for blocking bugs only. Nits do not block. Do not use paid Bugbot.
 5. Findings: the authoring agent fixes and pushes. A new push **drops** the `review-passed` label, so review must run again. Stop after two review rounds unless a finding is still merge-blocking.
 6. No blocking findings: add the `review-passed` label.
 7. When the PR is ready, has `review-passed`, is mergeable, and `unit` is green, GitHub **squash-merges** and deletes the head branch.
