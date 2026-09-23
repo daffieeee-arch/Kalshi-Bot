@@ -1,4 +1,9 @@
-"""Offline last-minute model vs settlement on a production JSONL capture."""
+"""Offline last-minute model vs settlement on a production JSONL capture.
+
+A paper take waits until the close average has at least ``_MIN_TAKE_CLOSE_WINDOW``
+ticks. Earlier last-minute hints stay untouched so the first close tick cannot
+lock a contract.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +29,8 @@ _SKIP_STREAMS = frozenset(
 )
 _CONTRACTS = Decimal("1")
 _SPOT_WINDOW = 90
+# 15 of 60 close ticks. n=1 takes fired before the average had any mass.
+_MIN_TAKE_CLOSE_WINDOW = 15
 
 
 @dataclass(frozen=True)
@@ -310,6 +317,9 @@ def _on_brti(window: _Window, msg: dict[str, Any], ts_ms: Any) -> None:
 
 
 def _maybe_take(window: _Window, signal: Any, ts_ms: Any) -> None:
+    n = window.close_window
+    if n is None or n < _MIN_TAKE_CLOSE_WINDOW:
+        return
     hint = signal.hint
     side: Side | None
     ask: Decimal | None
