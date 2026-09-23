@@ -58,7 +58,12 @@ class OrderbookState:
         payload = message.get("msg") or {}
         ticker = payload.get("market_ticker")
         if sid is None or seq is None or not ticker:
-            return ApplyResult(ok=False, invalid_reason="snapshot_missing_fields")
+            self._invalidate()
+            return ApplyResult(
+                ok=False,
+                need_snapshot=True,
+                invalid_reason="snapshot_missing_fields",
+            )
         self.market_ticker = str(ticker)
         self.sid = int(sid)
         self.last_seq = int(seq)
@@ -74,36 +79,44 @@ class OrderbookState:
         seq = message.get("seq")
         payload = message.get("msg") or {}
         if sid is None or seq is None:
-            self.valid = False
+            self._invalidate()
             return ApplyResult(ok=False, need_snapshot=True, invalid_reason="delta_missing_fields")
         if int(sid) != self.sid:
-            self.valid = False
+            self._invalidate()
             return ApplyResult(ok=False, need_snapshot=True, invalid_reason="sid_mismatch")
         expected = (self.last_seq or 0) + 1
         incoming = int(seq)
         if incoming != expected:
-            self.valid = False
+            self._invalidate()
             return ApplyResult(ok=False, need_snapshot=True, invalid_reason="seq_gap")
+        ticker = payload.get("market_ticker")
+        if not ticker or str(ticker) != self.market_ticker:
+            self._invalidate()
+            reason = "ticker_mismatch" if ticker else "delta_missing_ticker"
+            return ApplyResult(ok=False, need_snapshot=True, invalid_reason=reason)
         side = payload.get("side")
         if side not in ("yes", "no"):
-            self.valid = False
+            self._invalidate()
             return ApplyResult(ok=False, need_snapshot=True, invalid_reason="bad_side")
         price = Decimal(str(payload["price_dollars"]))
         delta = Decimal(str(payload["delta_fp"]))
         book = self._book(side)
         nxt = book.get(price, Decimal("0")) + delta
         if nxt < 0:
-            self.valid = False
+            self._invalidate()
             return ApplyResult(ok=False, need_snapshot=True, invalid_reason="negative_level")
         if nxt == 0:
             book.pop(price, None)
         else:
             book[price] = nxt
         self.last_seq = incoming
-        ticker = payload.get("market_ticker")
-        if ticker:
-            self.market_ticker = str(ticker)
         return ApplyResult(ok=True, applied=True)
+
+    def _invalidate(self) -> None:
+        """Drop quotes. Identity stays so a later snapshot can replace this book."""
+        self.valid = False
+        self.yes.clear()
+        self.no.clear()
 
     def _book(self, side: Side) -> dict[Decimal, Decimal]:
         if side == "yes":

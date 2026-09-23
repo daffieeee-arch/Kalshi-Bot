@@ -75,21 +75,58 @@ def last_minute_yes_prob(
     sigma = float(sigma_per_tick)
     if sigma <= 0:
         return Decimal("1") if spot >= need_avg else Decimal("0")
-    z = float(spot - need_avg) / (sigma * math.sqrt(remaining))
+    # Future levels are S_k = S_0 + e_1 + ... + e_k with independent N(0, sigma^2)
+    # increments. SD of their average is not the SD of the last level.
+    z = float(spot - need_avg) / (sigma * _mean_level_scale(remaining))
     return _clamp01(Decimal(str(norm_cdf(z))))
 
 
-def realized_sigma(spots: list[Decimal], *, fallback: Decimal = _DEFAULT_SIGMA) -> Decimal:
-    """Stdev of successive BRTI diffs, dollars per sqrt(tick)."""
+def realized_sigma(
+    spots: list[Decimal],
+    *,
+    fallback: Decimal = _DEFAULT_SIGMA,
+    timestamps_ms: list[int] | None = None,
+) -> Decimal:
+    """Stdev of successive BRTI diffs.
+
+    Without timestamps each step is one tick. With timestamps, scale each
+    increment by 1/sqrt(dt_seconds) so the result is dollars per sqrt(second).
+    """
+    if timestamps_ms is not None and len(timestamps_ms) != len(spots):
+        raise ValueError("timestamps_ms must have one entry per spot")
     if len(spots) < 8:
         return fallback
-    diffs = [float(spots[i] - spots[i - 1]) for i in range(1, len(spots))]
+    diffs: list[float] = []
+    for i in range(1, len(spots)):
+        step = float(spots[i] - spots[i - 1])
+        if timestamps_ms is None:
+            diffs.append(step)
+            continue
+        dt_ms = timestamps_ms[i] - timestamps_ms[i - 1]
+        if dt_ms <= 0:
+            continue
+        diffs.append(step / math.sqrt(dt_ms / 1000.0))
+    if len(diffs) < 7:
+        return fallback
     mean = sum(diffs) / len(diffs)
     var = sum((x - mean) ** 2 for x in diffs) / (len(diffs) - 1)
     sigma = math.sqrt(max(var, 0.0))
     if sigma <= 0.5:
         return fallback
     return Decimal(str(round(sigma, 4)))
+
+
+def sigma_from_samples(samples: list[tuple[int | None, Decimal]]) -> Decimal:
+    """Per-sqrt-second sigma when every sample has a timestamp, else per tick."""
+    values = [spot for _, spot in samples]
+    stamps: list[int] = []
+    for ts, _spot in samples:
+        if ts is None:
+            return realized_sigma(values)
+        stamps.append(ts)
+    if not stamps:
+        return realized_sigma(values)
+    return realized_sigma(values, timestamps_ms=stamps)
 
 
 def evaluate(
@@ -102,12 +139,17 @@ def evaluate(
     yes_ask: Decimal | None,
     no_ask: Decimal | None,
     sigma: Decimal,
+    book_valid: bool = True,
+    data_fresh: bool = True,
+    market_status: str | None = None,
+    book_ticker: str | None = None,
+    reference_ticker: str | None = None,
 ) -> Signal:
     """Pick last-minute remaining-average math in the close minute, else mid-window."""
     gap = (spot - strike) if spot is not None and strike is not None else None
     in_last = (
         seconds_left is not None
-        and seconds_left <= _LAST_MINUTE_S
+        and 0 < seconds_left <= _LAST_MINUTE_S
         and close_avg is not None
         and close_window is not None
         and close_window > 0
@@ -126,6 +168,16 @@ def evaluate(
     yes_edge = _edge(model, yes_ask) if model is not None and yes_ask is not None else None
     no_model = (Decimal("1") - model) if model is not None else None
     no_edge = _edge(no_model, no_ask) if no_model is not None and no_ask is not None else None
+    eligible, blocked = _entry_block(
+        seconds_left=seconds_left,
+        book_valid=book_valid,
+        data_fresh=data_fresh,
+        market_status=market_status,
+        book_ticker=book_ticker,
+        reference_ticker=reference_ticker,
+    )
+    if not eligible:
+        note = blocked
     return Signal(
         regime=regime,
         spot=spot,
@@ -138,7 +190,7 @@ def evaluate(
         no_ask=no_ask,
         yes_edge=yes_edge,
         no_edge=no_edge,
-        hint=_hint(regime, yes_edge, no_edge),
+        hint=_hint(regime, yes_edge, no_edge) if eligible else "wait",
         note=note,
     )
 
@@ -159,6 +211,38 @@ def signal_to_dict(signal: Signal) -> dict[str, str | float | None]:
         "hint": signal.hint,
         "note": signal.note,
     }
+
+
+_OPEN_STATUS = frozenset({"open", "active"})
+
+
+def _mean_level_scale(remaining: int) -> float:
+    """sqrt((r+1)*(2r+1)/(6r)) for the SD of a random-walk average."""
+    r = remaining
+    return math.sqrt((r + 1) * (2 * r + 1) / (6 * r))
+
+
+def _entry_block(
+    *,
+    seconds_left: float | None,
+    book_valid: bool,
+    data_fresh: bool,
+    market_status: str | None,
+    book_ticker: str | None,
+    reference_ticker: str | None,
+) -> tuple[bool, str]:
+    """Shared gate for paper hints. A closed, stale, or foreign book cannot hint."""
+    if seconds_left is not None and seconds_left <= 0:
+        return False, "market closed"
+    if market_status is not None and market_status.lower() not in _OPEN_STATUS:
+        return False, "market not open"
+    if book_ticker and reference_ticker and book_ticker != reference_ticker:
+        return False, "ticker mismatch"
+    if not book_valid:
+        return False, "book invalid"
+    if not data_fresh:
+        return False, "stale data"
+    return True, ""
 
 
 def _edge(model: Decimal, ask: Decimal) -> Decimal:

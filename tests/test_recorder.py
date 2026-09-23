@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from kalshi_bot.config import load_settings
+from kalshi_bot.discover import parse_kxbtc15m_close
 from kalshi_bot.paper import PaperIntent, PaperLedger
 from kalshi_bot.record import JsonlWriter
 from kalshi_bot.recorder import DISCOVER_INTERVAL_S, SETTLE_PENDING_S, Recorder
@@ -100,6 +101,31 @@ def test_incomplete_window_does_not_settle(tmp_path: Path) -> None:
     rec.floor_strike = Decimal("100")
     rec._maybe_settle(_close_avg("150", window_size=14))
     assert rec.paper.intents[0].settled is False
+
+
+def test_parseable_ticker_rejects_foreign_close_window(tmp_path: Path) -> None:
+    rec = _recorder(tmp_path)
+    ticker = "KXBTC15M-26SEP221015-15"
+    rec.paper.add(_intent(ticker))
+    rec.ticker = ticker
+    rec.floor_strike = Decimal("100")
+    rec._maybe_settle(_close_avg("150"))
+    assert rec.paper.intents[0].settled is False
+    close = parse_kxbtc15m_close(ticker)
+    assert close is not None
+    close_ms = int(close.timestamp() * 1000)
+    rec._maybe_settle(
+        {
+            "last_60s_windowed_average_15min": {
+                "value": "150",
+                "window_size": 60,
+                "window_start_ts_ms": close_ms - 60_000,
+                "window_end_ts_exclusive": close_ms,
+            }
+        }
+    )
+    assert rec.paper.intents[0].settled is True
+    assert rec.paper.intents[0].won is True
 
 
 def test_write_market_meta_records_strike(tmp_path: Path) -> None:
