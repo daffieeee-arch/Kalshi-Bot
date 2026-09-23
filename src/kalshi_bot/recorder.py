@@ -12,11 +12,11 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
 from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.config import BRTI_INDEX_ID, SERIES_TICKER_BTC_15M, Settings, require_prod_credentials
-from kalshi_bot.discover import is_currently_open, summarize_market
+from kalshi_bot.discover import is_currently_open, parse_kxbtc15m_close, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.paper import PaperIntent, PaperLedger
 from kalshi_bot.record import JsonlWriter, extract_ts_ms
@@ -31,6 +31,74 @@ DISCOVER_INTERVAL_S = 15.0
 # Close tick is at :00/:15/:30/:45 (window_size 60). Keep the just-closed
 # ticker only long enough to catch a late BRTI close, not the next slot.
 SETTLE_PENDING_S = 90.0
+# BRTI window bounds are unix ms. Allow a small skew around the quarter close.
+_CLOSE_MATCH_MS = 2_000
+_FINAL_MINUTE_MS = 60_000
+_SETTLE_EVENT_MS = 5_000
+
+
+def brti_close_average_belongs(
+    ticker: str,
+    window: Mapping[str, Any],
+    *,
+    event_ts_ms: int | None,
+) -> bool:
+    """True when this 15m close average is the final minute of `ticker`."""
+    close_ms = _ticker_close_ms(ticker)
+    if close_ms is None:
+        return True
+    start = window.get("window_start_ts_ms")
+    if start is not None and abs(int(start) - (close_ms - _FINAL_MINUTE_MS)) <= _CLOSE_MATCH_MS:
+        return True
+    if event_ts_ms is None:
+        return False
+    delta = close_ms - int(event_ts_ms)
+    if not (-_SETTLE_EVENT_MS <= delta <= _FINAL_MINUTE_MS):
+        return False
+    if start is None:
+        return True
+    # A partial window can start inside the final minute. A start from another
+    # quarter cannot, even if the event timestamp fell in this one.
+    start_ms = int(start)
+    minute_lo = close_ms - _FINAL_MINUTE_MS - _CLOSE_MATCH_MS
+    minute_hi = close_ms + _CLOSE_MATCH_MS
+    return minute_lo <= start_ms <= minute_hi
+
+
+def brti_settlement_matches(
+    ticker: str,
+    window: Mapping[str, Any],
+    *,
+    event_ts_ms: int | None,
+) -> bool:
+    """True when a full 60-tick print is this ticker's quarter close, not a later one."""
+    if int(window.get("window_size") or 0) < 60:
+        return False
+    close_ms = _ticker_close_ms(ticker)
+    if close_ms is None:
+        return True
+    start = window.get("window_start_ts_ms")
+    end = window.get("window_end_ts_exclusive")
+    if start is not None or end is not None:
+        start_ok = (
+            start is not None
+            and abs(int(start) - (close_ms - _FINAL_MINUTE_MS)) <= _CLOSE_MATCH_MS
+        )
+        end_ok = end is not None and abs(int(end) - close_ms) <= _CLOSE_MATCH_MS
+        if start is not None and end is not None:
+            return start_ok and end_ok
+        return start_ok or end_ok
+    if event_ts_ms is None:
+        return False
+    delta = int(event_ts_ms) - close_ms
+    return -_SETTLE_EVENT_MS <= delta <= _SETTLE_EVENT_MS
+
+
+def _ticker_close_ms(ticker: str) -> int | None:
+    close_at = parse_kxbtc15m_close(ticker)
+    if close_at is None:
+        return None
+    return int(close_at.timestamp() * 1000)
 
 
 @dataclass
@@ -304,6 +372,10 @@ class Recorder:
         if not isinstance(window, dict) or ticker is None or strike is None:
             return
         if int(window.get("window_size") or 0) < 60:
+            return
+        received = payload.get("received_at")
+        event_ts = int(received) if received is not None else None
+        if not brti_settlement_matches(ticker, window, event_ts_ms=event_ts):
             return
         close_avg = Decimal(str(window["value"]))
         self.paper.on_settlement(

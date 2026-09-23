@@ -10,6 +10,8 @@ from kalshi_bot.fees import quadratic_taker_fee
 from kalshi_bot.orderbook import OrderbookState, Side
 
 PaperStyle = Literal["maker", "taker"]
+PaperStatus = Literal["open", "settled"]
+SettlementSource = Literal["official", "reconstructed"]
 
 
 @dataclass
@@ -26,6 +28,17 @@ class PaperFill:
     source: str
 
 
+@dataclass(frozen=True)
+class SettlementMark:
+    """Realized outcome for one market. Official result wins over a local compare."""
+
+    market_ticker: str
+    yes_won: bool
+    source: SettlementSource
+    reconstructed_yes: bool | None
+    mismatch: bool
+
+
 @dataclass
 class PaperIntent:
     """A resting or aggressive paper order that never leaves this process."""
@@ -37,6 +50,7 @@ class PaperIntent:
     style: PaperStyle
     remaining: Decimal = field(init=False)
     fills: list[PaperFill] = field(default_factory=list)
+    status: PaperStatus = "open"
     settled: bool = False
     won: bool | None = None
     pnl: Decimal | None = None
@@ -51,6 +65,8 @@ class PaperLedger:
 
     fee_multiplier: Decimal = Decimal("1")
     intents: list[PaperIntent] = field(default_factory=list)
+    # Displayed size already used. The captured book itself is not edited.
+    _taken: dict[tuple[str, Side, Decimal], Decimal] = field(default_factory=dict)
 
     def add(self, intent: PaperIntent) -> None:
         self.intents.append(intent)
@@ -60,7 +76,7 @@ class PaperLedger:
         if not book.valid or not book.market_ticker:
             return fills
         for intent in self.intents:
-            if intent.style != "taker" or intent.remaining <= 0:
+            if not _is_open(intent) or intent.style != "taker":
                 continue
             if intent.market_ticker != book.market_ticker:
                 continue
@@ -68,10 +84,13 @@ class PaperLedger:
             if ask is None or ask > intent.price:
                 continue
             opposite: Side = "no" if intent.outcome == "yes" else "yes"
-            available = book.size_at(opposite, Decimal("1") - ask)
-            qty = min(intent.remaining, available)
+            price_level = Decimal("1") - ask
+            available = book.size_at(opposite, price_level)
+            room = self._room(intent.market_ticker, opposite, price_level, available)
+            qty = min(intent.remaining, room)
             if qty <= 0:
                 continue
+            self._consume(intent.market_ticker, opposite, price_level, qty)
             fills.extend(self._fill(intent, price=ask, count=qty, ts_ms=ts_ms, source="book"))
         return fills
 
@@ -85,8 +104,9 @@ class PaperLedger:
         ts_ms = payload.get("ts_ms")
         taker_book_side = payload.get("taker_book_side")
         fills: list[PaperFill] = []
+        left = count
         for intent in self.intents:
-            if intent.style != "maker" or intent.remaining <= 0:
+            if not _is_open(intent) or intent.style != "maker":
                 continue
             if intent.market_ticker != ticker:
                 continue
@@ -95,9 +115,10 @@ class PaperLedger:
             trade_price = yes_price if intent.outcome == "yes" else (Decimal("1") - yes_price)
             if trade_price > intent.price:
                 continue
-            qty = min(intent.remaining, count)
+            qty = min(intent.remaining, left)
             if qty <= 0:
                 continue
+            left -= qty
             fills.extend(
                 self._fill(
                     intent,
@@ -113,15 +134,34 @@ class PaperLedger:
         self,
         *,
         market_ticker: str,
-        close_avg: Decimal,
-        floor_strike: Decimal,
-    ) -> None:
-        yes_won = close_avg >= floor_strike
+        close_avg: Decimal | None = None,
+        floor_strike: Decimal | None = None,
+        official_result: Literal["yes", "no"] | None = None,
+    ) -> SettlementMark | None:
+        """Settle open intents. `official_result` is the P&L; the average is QA only."""
+        reconstructed = _reconstructed_yes(close_avg, floor_strike)
+        if official_result == "yes":
+            yes_won = True
+            source: SettlementSource = "official"
+        elif official_result == "no":
+            yes_won = False
+            source = "official"
+        elif official_result is None:
+            if reconstructed is None:
+                return None
+            yes_won = reconstructed
+            source = "reconstructed"
+        else:
+            unreachable: Never = official_result
+            raise ValueError(f"unknown official result {unreachable!r}")
+        mismatch = reconstructed is not None and reconstructed != yes_won
         for intent in self.intents:
-            if intent.market_ticker != market_ticker or intent.settled:
+            if intent.market_ticker != market_ticker or intent.status != "open":
                 continue
-            filled = intent.count - intent.remaining
+            filled = sum((fill.count for fill in intent.fills), Decimal("0"))
+            intent.status = "settled"
             intent.settled = True
+            intent.remaining = Decimal("0")
             intent.won = yes_won if intent.outcome == "yes" else (not yes_won)
             if filled <= 0:
                 intent.pnl = Decimal("0")
@@ -130,6 +170,25 @@ class PaperLedger:
             cost = sum((fill.price * fill.count for fill in intent.fills), Decimal("0"))
             payout = filled if intent.won else Decimal("0")
             intent.pnl = payout - cost - fees
+        return SettlementMark(
+            market_ticker=market_ticker,
+            yes_won=yes_won,
+            source=source,
+            reconstructed_yes=reconstructed,
+            mismatch=mismatch,
+        )
+
+    def _room(self, ticker: str, side: Side, price: Decimal, available: Decimal) -> Decimal:
+        key = (ticker, side, price)
+        taken = self._taken.get(key, Decimal("0"))
+        if available < taken:
+            taken = available
+            self._taken[key] = taken
+        return available - taken
+
+    def _consume(self, ticker: str, side: Side, price: Decimal, qty: Decimal) -> None:
+        key = (ticker, side, price)
+        self._taken[key] = self._taken.get(key, Decimal("0")) + qty
 
     def _fill(
         self,
@@ -161,6 +220,21 @@ class PaperLedger:
         intent.remaining -= count
         intent.fills.append(fill)
         return [fill]
+
+
+def _is_open(intent: PaperIntent) -> bool:
+    return intent.status == "open" and not intent.settled and intent.remaining > 0
+
+
+def _reconstructed_yes(close_avg: Decimal | None, floor_strike: Decimal | None) -> bool | None:
+    """QA compare of the published BRTI window average to the floor strike.
+
+    The feed already formats that average to 8 decimal places. Kalshi's market
+    `result` is the realized outcome; this compare is not a second settlement.
+    """
+    if close_avg is None or floor_strike is None:
+        return None
+    return close_avg >= floor_strike
 
 
 def _maker_hit(outcome: Side, taker_book_side: Any) -> bool:

@@ -19,8 +19,12 @@ from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.discover import parse_kxbtc15m_close
 from kalshi_bot.orderbook import OrderbookState, Side
 from kalshi_bot.paper import PaperIntent, PaperLedger
-from kalshi_bot.recorder import SETTLE_PENDING_S
-from kalshi_bot.signal import evaluate, realized_sigma
+from kalshi_bot.recorder import (
+    SETTLE_PENDING_S,
+    brti_close_average_belongs,
+    brti_settlement_matches,
+)
+from kalshi_bot.signal import evaluate, sigma_from_samples
 
 _SETTLE_PENDING_MS = int(SETTLE_PENDING_S * 1000)
 
@@ -61,6 +65,8 @@ class WindowResult:
     seconds_left: float | None
     pnl: Decimal | None
     skip: str | None
+    outcome_mismatch: bool | None = None
+    reconstructed_yes: bool | None = None
 
 
 @dataclass
@@ -108,7 +114,7 @@ class _Window:
         self.ticker = ticker
         self.info = info
         self.book = OrderbookState()
-        self.spots: deque[Decimal] = deque(maxlen=_SPOT_WINDOW)
+        self.spots: deque[tuple[int | None, Decimal]] = deque(maxlen=_SPOT_WINDOW)
         self.close_avg: Decimal | None = None
         self.close_window: int | None = None
         self.close_at = parse_kxbtc15m_close(ticker)
@@ -284,16 +290,22 @@ def _on_brti(window: _Window, msg: dict[str, Any], ts_ms: Any) -> None:
     view = _brti_view(msg)
     spot = view.get("value")
     if spot is not None:
-        window.spots.append(Decimal(str(spot)))
-    if view.get("close_avg") is not None:
-        window.close_avg = Decimal(str(view["close_avg"]))
-    if view.get("close_window") is not None:
-        window.close_window = int(view["close_window"])
+        stamp = int(ts_ms) if ts_ms is not None else None
+        window.spots.append((stamp, Decimal(str(spot))))
+    close = msg.get("last_60s_windowed_average_15min") or {}
+    event_ts = int(ts_ms) if ts_ms is not None else None
+    if isinstance(close, dict) and close.get("value") is not None:
+        if brti_close_average_belongs(window.ticker, close, event_ts_ms=event_ts):
+            window.close_avg = Decimal(str(close["value"]))
+            if close.get("window_size") is not None:
+                window.close_window = int(close["window_size"])
     seconds_left = _seconds_left(window, ts_ms)
-    if window.close_window is not None and window.close_window >= 60:
-        left = seconds_left
-        if left is None or left <= 5:
-            _settle(window)
+    if isinstance(close, dict) and brti_settlement_matches(
+        window.ticker,
+        close,
+        event_ts_ms=event_ts,
+    ):
+        _settle(window)
         return
     if (
         window.decision is None
@@ -308,9 +320,12 @@ def _on_brti(window: _Window, msg: dict[str, Any], ts_ms: Any) -> None:
             seconds_left=seconds_left,
             close_avg=window.close_avg,
             close_window=window.close_window,
-            yes_ask=window.book.implied_ask("yes"),
-            no_ask=window.book.implied_ask("no"),
-            sigma=realized_sigma(list(window.spots)),
+            yes_ask=window.book.implied_ask("yes") if window.book.valid else None,
+            no_ask=window.book.implied_ask("no") if window.book.valid else None,
+            sigma=sigma_from_samples(list(window.spots)),
+            book_valid=window.book.valid,
+            book_ticker=window.book.market_ticker,
+            reference_ticker=window.ticker,
         )
         if signal.regime == "last_minute":
             _maybe_take(window, signal, ts_ms)
@@ -372,20 +387,23 @@ def _settle(window: _Window) -> None:
     strike = window.strike
     if window.close_avg is None or strike is None:
         return
-    yes_won = _yes_won(window.info, window.close_avg, strike)
-    if yes_won is None:
-        return
-    window.ledger.on_settlement(
+    official = window.info.result if window.info is not None else None
+    mark = window.ledger.on_settlement(
         market_ticker=window.ticker,
         close_avg=window.close_avg,
         floor_strike=strike,
+        official_result=official,
     )
+    if mark is None:
+        return
     window.settled = True
     if window.decision is not None:
         intent = window.ledger.intents[0] if window.ledger.intents else None
-        window.decision.yes_won = yes_won
+        window.decision.yes_won = mark.yes_won
         window.decision.close_avg = window.close_avg
         window.decision.pnl = intent.pnl if intent is not None else Decimal("0")
+        window.decision.outcome_mismatch = mark.mismatch
+        window.decision.reconstructed_yes = mark.reconstructed_yes
         if intent is not None and not intent.fills:
             window.decision.skip = "no_fill"
             window.decision.pnl = None
@@ -405,6 +423,15 @@ def _finish(window: _Window) -> WindowResult:
         skip = "no_close"
     elif not window.settled:
         skip = "open"
+    reconstructed = (
+        window.close_avg >= window.strike
+        if window.close_avg is not None and window.strike is not None
+        else None
+    )
+    official = window.info.result if window.info is not None else None
+    mismatch = None
+    if official is not None and reconstructed is not None:
+        mismatch = (official == "yes") != reconstructed
     return WindowResult(
         ticker=window.ticker,
         strike=window.strike,
@@ -412,7 +439,7 @@ def _finish(window: _Window) -> WindowResult:
         yes_won=_yes_won(window.info, window.close_avg, window.strike)
         if window.close_avg is not None and window.strike is not None
         else None,
-        official_result=window.info.result if window.info else None,
+        official_result=official,
         hint=None,
         side=None,
         ask=None,
@@ -422,6 +449,8 @@ def _finish(window: _Window) -> WindowResult:
         seconds_left=None,
         pnl=None,
         skip=skip,
+        outcome_mismatch=mismatch,
+        reconstructed_yes=reconstructed,
     )
 
 
@@ -504,4 +533,6 @@ def _window_dict(row: WindowResult) -> dict[str, Any]:
         "seconds_left": None if row.seconds_left is None else round(row.seconds_left, 1),
         "pnl": None if row.pnl is None else format(row.pnl, "f"),
         "skip": row.skip,
+        "outcome_mismatch": row.outcome_mismatch,
+        "reconstructed_yes": row.reconstructed_yes,
     }

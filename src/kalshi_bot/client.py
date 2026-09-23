@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -11,6 +11,35 @@ from kalshi_bot.auth import auth_headers, load_private_key
 from kalshi_bot.config import DEMO_REST_BASE, PROD_REST_BASE, Settings
 
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def locked_relative_path(base: str, path: str) -> str:
+    """Reject absolute URLs so httpx cannot drop the locked base host."""
+    raw = path.strip()
+    lowered = raw.lower()
+    if (
+        not raw
+        or "\\" in raw
+        or raw.startswith("//")
+        or "://" in lowered
+    ):
+        raise ValueError(f"refusing absolute URL: {path!r}")
+    relative = raw.lstrip("/")
+    if not relative or "://" in relative.lower() or relative.startswith("//"):
+        raise ValueError(f"refusing absolute URL: {path!r}")
+    base_url = base.rstrip("/") + "/"
+    resolved = urljoin(base_url, relative)
+    base_parts = urlsplit(base_url)
+    parts = urlsplit(resolved)
+    if (
+        parts.scheme.lower() != (base_parts.scheme or "").lower()
+        or (parts.hostname or "").lower() != (base_parts.hostname or "").lower()
+        or parts.port != base_parts.port
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise ValueError(f"refusing absolute URL outside locked host: {resolved}")
+    return relative
 
 
 class KalshiDemoClient:
@@ -43,7 +72,8 @@ class KalshiDemoClient:
         self.close()
 
     def _absolute_url(self, path: str) -> str:
-        return urljoin(self.settings.rest_base.rstrip("/") + "/", path.lstrip("/"))
+        relative = locked_relative_path(self.settings.rest_base, path)
+        return urljoin(self.settings.rest_base.rstrip("/") + "/", relative)
 
     def request(
         self,
@@ -78,7 +108,7 @@ class KalshiDemoClient:
 
         response = self._client.request(
             method,
-            path.lstrip("/"),
+            locked_relative_path(self.settings.rest_base, path),
             params=params,
             headers=headers,
             json=json_body,
@@ -171,7 +201,8 @@ class KalshiReadClient:
         self.close()
 
     def _absolute_url(self, path: str) -> str:
-        return urljoin(self.settings.prod_rest_base.rstrip("/") + "/", path.lstrip("/"))
+        relative = locked_relative_path(self.settings.prod_rest_base, path)
+        return urljoin(self.settings.prod_rest_base.rstrip("/") + "/", relative)
 
     def request(
         self,
@@ -197,7 +228,12 @@ class KalshiReadClient:
                     url_or_path=self._absolute_url(path),
                 )
             )
-        response = self._client.request(method, path.lstrip("/"), params=params, headers=headers)
+        response = self._client.request(
+            method,
+            locked_relative_path(self.settings.prod_rest_base, path),
+            params=params,
+            headers=headers,
+        )
         response.raise_for_status()
         if not response.content:
             return None

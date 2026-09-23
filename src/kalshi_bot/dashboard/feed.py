@@ -17,7 +17,7 @@ from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import is_currently_open, parse_kxbtc15m_close, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
-from kalshi_bot.signal import evaluate, realized_sigma, signal_to_dict
+from kalshi_bot.signal import evaluate, sigma_from_samples, signal_to_dict
 
 _DISCOVER_INTERVAL_S = 15.0
 
@@ -29,6 +29,7 @@ _CHUNK_BYTES = 4_000_000
 _TAPE_MAX = 80
 _RATE_WINDOW_S = 5.0
 _SPOT_WINDOW = 90
+_QUOTE_MAX_AGE_S = 5.0
 STREAM_LABELS = {
     "cfbenchmarks_value": "BRTI 1 Hz",
     "cfbenchmarks_value_5hz": "BRTI 5 Hz",
@@ -73,12 +74,14 @@ class LiveFeed:
         self._rate_times: deque[tuple[float, str]] = deque()
         self._tape: deque[dict[str, Any]] = deque(maxlen=_TAPE_MAX)
         self._brti: dict[str, Any] = {}
-        self._spots: deque[Decimal] = deque(maxlen=_SPOT_WINDOW)
+        self._spots: deque[tuple[int | None, Decimal]] = deque(maxlen=_SPOT_WINDOW)
         self._market: dict[str, Any] = {}
         self._last_row_at: str | None = None
         self._book_status = "waiting_snapshot"
         self._error: str | None = None
         self._last_discover = 0.0
+        self._book_mono: float | None = None
+        self._brti_mono: float | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -96,10 +99,11 @@ class LiveFeed:
         now = time.time()
         with self._lock:
             rates = self._rates(now)
-            yes_bid = self.book.best_bid("yes")
-            no_bid = self.book.best_bid("no")
-            yes_ask = self.book.implied_ask("yes")
-            no_ask = self.book.implied_ask("no")
+            book_ok = self.book.valid
+            yes_bid = self.book.best_bid("yes") if book_ok else None
+            no_bid = self.book.best_bid("no") if book_ok else None
+            yes_ask = self.book.implied_ask("yes") if book_ok else None
+            no_ask = self.book.implied_ask("no") if book_ok else None
             ticker = self.book.market_ticker or self._market.get("ticker")
             market = self._market_for(ticker)
             close_at = parse_kxbtc15m_close(str(ticker)) if ticker else None
@@ -110,6 +114,8 @@ class LiveFeed:
             spot = self._brti.get("value")
             close_avg = self._brti.get("close_avg")
             close_window = self._brti.get("close_window")
+            status = market.get("status")
+            reference = self._market.get("ticker")
             signal = evaluate(
                 spot=Decimal(str(spot)) if spot is not None else None,
                 strike=Decimal(str(strike)) if strike is not None else None,
@@ -118,7 +124,12 @@ class LiveFeed:
                 close_window=int(close_window) if close_window is not None else None,
                 yes_ask=yes_ask,
                 no_ask=no_ask,
-                sigma=realized_sigma(list(self._spots)),
+                sigma=sigma_from_samples(list(self._spots)),
+                book_valid=book_ok,
+                data_fresh=self._data_fresh(time.monotonic()),
+                market_status=str(status) if status else None,
+                book_ticker=self.book.market_ticker,
+                reference_ticker=str(reference) if reference else None,
             )
             return {
                 "recorder": self._recorder_status(),
@@ -130,8 +141,8 @@ class LiveFeed:
                 "title": market.get("title"),
                 "book": {
                     "valid": self.book.valid,
-                    "yes": _levels(self.book.yes, reverse=True),
-                    "no": _levels(self.book.no, reverse=True),
+                    "yes": _levels(self.book.yes, reverse=True) if book_ok else [],
+                    "no": _levels(self.book.no, reverse=True) if book_ok else [],
                     "yes_bid": _dec(yes_bid),
                     "no_bid": _dec(no_bid),
                     "yes_ask": _dec(yes_ask),
@@ -198,13 +209,22 @@ class LiveFeed:
             self._rate_times.append((now, stream))
             self._last_row_at = str(row.get("local_received_at") or "")
             if stream == "orderbook_snapshot":
-                if self.book.apply_snapshot(payload).ok:
+                previous = self.book.market_ticker
+                result = self.book.apply_snapshot(payload)
+                if result.ok:
                     self._book_status = "live"
+                    self._book_mono = time.monotonic()
+                    self._drop_close_if_ticker_changed(previous)
                     self._forget_stale_market()
+                else:
+                    self._book_status = "need_snapshot"
             elif stream == "orderbook_delta":
+                previous = self.book.market_ticker
                 result = self.book.apply_delta(payload)
                 if result.ok:
                     self._book_status = "live"
+                    self._book_mono = time.monotonic()
+                    self._drop_close_if_ticker_changed(previous)
                     self._forget_stale_market()
                 elif result.need_snapshot:
                     self._book_status = "need_snapshot"
@@ -222,7 +242,8 @@ class LiveFeed:
                 )
             elif stream == "cfbenchmarks_value":
                 self._brti = _brti_view(msg)
-                self._remember_spot(self._brti.get("value"))
+                self._brti_mono = time.monotonic()
+                self._remember_spot(self._brti.get("value"), row.get("ts_ms") or msg.get("received_at"))
             elif stream == "cfbenchmarks_value_5hz":
                 current = _brti_spot(msg)
                 if current is not None:
@@ -293,10 +314,27 @@ class LiveFeed:
             else None,
         }
 
-    def _remember_spot(self, value: Any) -> None:
+    def _drop_close_if_ticker_changed(self, previous: str | None) -> None:
+        current = self.book.market_ticker
+        if not previous or not current or previous == current:
+            return
+        self._brti.pop("close_avg", None)
+        self._brti.pop("close_window", None)
+
+    def _data_fresh(self, now: float) -> bool:
+        if self._book_mono is None or self._brti_mono is None:
+            return False
+        if now - self._book_mono > _QUOTE_MAX_AGE_S:
+            return False
+        if now - self._brti_mono > _QUOTE_MAX_AGE_S:
+            return False
+        return True
+
+    def _remember_spot(self, value: Any, ts_ms: Any) -> None:
         if value is None:
             return
-        self._spots.append(Decimal(str(value)))
+        stamp = int(ts_ms) if ts_ms is not None else None
+        self._spots.append((stamp, Decimal(str(value))))
 
     def _rates(self, now: float) -> dict[str, float]:
         while self._rate_times and now - self._rate_times[0][0] > _RATE_WINDOW_S:
