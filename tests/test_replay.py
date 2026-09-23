@@ -75,7 +75,8 @@ def test_replay_takes_last_minute_yes_and_settles(tmp_path: Path) -> None:
         jsonl,
         [
             _row("orderbook_snapshot", _snapshot(market_ticker=_TICKER), ts_open),
-            _row("cfbenchmarks_value", _brti("86000", "85900", 10, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 1, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 15, ts_open), ts_open),
             _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_close), ts_close),
         ],
     )
@@ -87,6 +88,7 @@ def test_replay_takes_last_minute_yes_and_settles(tmp_path: Path) -> None:
     row = report.traded[0]
     assert row.side == "yes"
     assert row.hint == "paper YES?"
+    assert row.n == 15
     assert row.yes_won is True
     assert row.pnl is not None and row.pnl > 0
     assert report.wins == 1
@@ -101,7 +103,8 @@ def test_replay_waits_when_book_already_locked(tmp_path: Path) -> None:
         jsonl,
         [
             _row("orderbook_snapshot", snap, ts_open),
-            _row("cfbenchmarks_value", _brti("86000", "85900", 10, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 1, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 15, ts_open), ts_open),
             _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_close), ts_close),
         ],
     )
@@ -113,7 +116,7 @@ def test_replay_waits_when_book_already_locked(tmp_path: Path) -> None:
         strike=Decimal("85000"),
         seconds_left=50,
         close_avg=Decimal("85900"),
-        close_window=10,
+        close_window=15,
         yes_ask=Decimal("0.99"),
         no_ask=Decimal("0.99"),
         sigma=realized_sigma([]),
@@ -165,7 +168,7 @@ def test_replay_settles_previous_window_after_roll(tmp_path: Path) -> None:
         jsonl,
         [
             _row("orderbook_snapshot", _snapshot(market_ticker=t1), ts_last),
-            _row("cfbenchmarks_value", _brti("86000", "85900", 10, ts_last), ts_last),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 15, ts_last), ts_last),
             _row("orderbook_snapshot", _snapshot(market_ticker=t2), ts_roll),
             _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_roll), ts_roll),
         ],
@@ -193,10 +196,33 @@ def test_replay_reads_strike_from_market_meta(tmp_path: Path) -> None:
         [
             _row("market_meta", {"ticker": _TICKER, "floor_strike": "85000"}, ts_open),
             _row("orderbook_snapshot", _snapshot(market_ticker=_TICKER), ts_open),
-            _row("cfbenchmarks_value", _brti("86000", "85900", 10, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 15, ts_open), ts_open),
             _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_close), ts_close),
         ],
     )
     report = replay(jsonl, {})
     assert report.traded[0].strike == Decimal("85000")
+    assert report.traded[0].n == 15
     assert report.traded[0].yes_won is True
+
+
+def test_replay_does_not_take_before_close_window_15(tmp_path: Path) -> None:
+    ts_open = _ts(10, 14, 10)
+    ts_close = _ts(10, 15, 0)
+    jsonl = tmp_path / "cap.jsonl"
+    _write(
+        jsonl,
+        [
+            _row("orderbook_snapshot", _snapshot(market_ticker=_TICKER), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 1, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85900", 14, ts_open), ts_open),
+            _row("cfbenchmarks_value", _brti("86000", "85950", 60, ts_close), ts_close),
+        ],
+    )
+    markets = {
+        _TICKER: MarketInfo(_TICKER, Decimal("85000"), "yes", "finalized"),
+    }
+    report = replay(jsonl, markets)
+    assert report.traded == []
+    assert report.waits == 1
+    assert report.windows[0].n == 60
