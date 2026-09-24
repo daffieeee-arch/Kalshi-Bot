@@ -273,6 +273,48 @@ legend {
   color: var(--no);
 }
 
+.paper-arms {
+  width: min(1200px, calc(100% - 32px));
+  margin: 12px auto;
+  display: grid;
+  gap: 12px;
+}
+
+.paper-arms:empty {
+  display: none;
+}
+
+.arm-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.arm-head,
+.arm-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: baseline;
+}
+
+.arm-head h2 {
+  margin: 0;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 18px;
+}
+
+.arm-note {
+  margin-top: 8px;
+}
+
+body.multi-arm #paper-single {
+  display: none;
+}
+
 .paused .hero,
 .paused .grid,
 .paused .blotter {

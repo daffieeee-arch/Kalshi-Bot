@@ -134,6 +134,14 @@ State lands in `data/paper-sessions/` (gitignored). A lock file stops a second p
 
 To pick up this behavior on the VPS, restart only `paper-btc-15m` (leave `record-btc-15m` writing the JSONL). Resume keeps the current session. For a clean bankroll with the same flags, stop the paper process, move `data/paper-sessions/` aside, then start again with `KALSHI_TRADE_ENV=paper`.
 
+Learned-exit **orders** are on unless `--no-learn-exit-orders` or `KALSHI_PAPER_LEARN_EXIT_ORDERS=0`. That switch does not stop training, `adjust_params`, rolling or mark adaptation, size, cooldown, stop, signal flip, take-profit, edge-gone, or settlement. The forwardtest runs both arms on the same capture with separate cash and learners. Do not delete an existing `data/paper-sessions/` tree to start it. The locked rules are in `docs/FORWARDTEST_LEARN_EXIT.md`.
+
+```bash
+paper-btc-15m --ab --bankroll 1000 --hours 24 --target-return 0.50
+```
+
+That starts `data/paper-sessions/ab-ref` (learned-exit orders on) and `data/paper-sessions/ab-nolearn` (those orders off). The same dashboard on `127.0.0.1:8787` (Tailscale `:8443`) shows both arms, the exit reason, and sub-second quote deltas. `metrics.json` next to each `state.json` has net and gross PnL, fees, closes, exposure, drawdown, and the settlement Brier.
+
 Replay the last-minute paper hint against official settlements (local report, no orders):
 
 ```bash
