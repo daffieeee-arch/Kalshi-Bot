@@ -28,6 +28,14 @@ from kalshi_bot.account import PaperAccount
 from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import parse_kxbtc15m_close
+from kalshi_bot.exit_audit import (
+    build_delta,
+    build_quote,
+    learner_influences,
+    prediction_row,
+    session_metrics,
+    stamp_settlement,
+)
 from kalshi_bot.learn import MIN_INFLUENCE, OnlineLearner
 from kalshi_bot.orderbook import OrderbookState, Side
 from kalshi_bot.paper import (
@@ -57,6 +65,8 @@ from kalshi_bot.strategy import (
 log = logging.getLogger("kalshi_bot.session")
 
 DEFAULT_SESSION_ROOT = Path("data/paper-sessions")
+AB_REF_DIR = "ab-ref"
+AB_NOLEARN_DIR = "ab-nolearn"
 _AMS_TZ = ZoneInfo("Europe/Amsterdam")
 _OFFICIAL_WAIT = timedelta(seconds=180)
 _POLL_EVERY = timedelta(seconds=15)
@@ -88,6 +98,15 @@ class PendingSettle:
     ticker: str
     strike: Decimal | None
     close_avg: Decimal | None
+    deadline: datetime
+    next_poll: datetime | None = None
+
+
+@dataclass
+class LabelWatch:
+    """A traded ticker still waiting for a settlement label. This does not change PnL."""
+
+    ticker: str
     deadline: datetime
     next_poll: datetime | None = None
 
@@ -133,6 +152,10 @@ class PaperSession:
         target_return: Decimal,
         account: PaperAccount,
         params: StrategyParams,
+        learn_exit_orders: bool = True,
+        arm: str | None = None,
+        min_closes: int | None = None,
+        drawdown_stop: Decimal | None = None,
     ) -> None:
         self.root = root
         self.session_id = session_id
@@ -142,6 +165,18 @@ class PaperSession:
         self.target_return = target_return
         self.account = account
         self.params = params
+        self.learn_exit_orders = learn_exit_orders
+        self.arm = _arm_for(learn_exit_orders, arm)
+        self.min_closes = min_closes
+        self.drawdown_stop = drawdown_stop
+        self.finished = False
+        self.finished_known = True
+        self.stop_reason: str | None = None
+        self.max_open = 0
+        self.equity_peak = bankroll
+        self.max_drawdown = Decimal("0")
+        self.predictions: list[dict[str, Any]] = []
+        self.label_watch: list[LabelWatch] = []
         self.learner = OnlineLearner.cold()
         self.adaptations: list[tuple[str, Adaptation]] = []
         self.last_entry_ms: int | None = None
@@ -176,6 +211,9 @@ class PaperSession:
         hours: float,
         target_return: Decimal,
         now: datetime,
+        learn_exit_orders: bool = True,
+        min_closes: int | None = None,
+        drawdown_stop: Decimal | None = None,
     ) -> PaperSession:
         if bankroll <= 0:
             raise ValueError("bankroll must be positive")
@@ -193,6 +231,9 @@ class PaperSession:
             target_return=target_return,
             account=PaperAccount(bankroll),
             params=initial_params(bankroll),
+            learn_exit_orders=learn_exit_orders,
+            min_closes=min_closes,
+            drawdown_stop=drawdown_stop,
         )
         session._fresh = True
         return session
@@ -229,9 +270,19 @@ class PaperSession:
     def run_loop(self, path: Path) -> int:
         self.catch_up(path)
         self.save()
+        stop_reason: str | None = None
         while not self._stop.is_set():
             now = datetime.now(timezone.utc)
-            if now >= self.ends_at:
+            if self._drawdown_hit():
+                stop_reason = "drawdown"
+                log.warning(
+                    "paper session %s drawdown from bankroll exceeded %s",
+                    self.session_id,
+                    format(self.drawdown_stop or Decimal("0"), "f"),
+                )
+                break
+            if self._schedule_done(now):
+                stop_reason = "schedule"
                 log.info("paper session %s reached %s", self.session_id, _ams(self.ends_at))
                 break
             try:
@@ -247,6 +298,9 @@ class PaperSession:
                 continue
             if self._stop.wait(0.1):
                 break
+        if stop_reason is not None:
+            self.finished = True
+            self.stop_reason = stop_reason
         self.save()
         return 0
 
@@ -284,6 +338,7 @@ class PaperSession:
                 continue
             still.append(item)
         self.pending = still
+        self._poll_labels(now)
 
     def settle_ticker(
         self,
@@ -316,10 +371,15 @@ class PaperSession:
             format(paid, "f"),
             mark.mismatch,
         )
+        moment = now or datetime.now(timezone.utc)
+        stamp = int(moment.timestamp() * 1000)
         for intent in watched:
             if intent.status == "settled":
+                learned = self.learner.wants_exit(intent.entry_features) if intent.entry_features else False
+                self._record_exit(intent, None, stamp, intent.exit_reason or "settlement", learned)
                 self._learn(intent, intent.exit_reason or "settlement")
-        self._maybe_adapt(now or datetime.now(timezone.utc))
+        self._apply_settlement_label(ticker, mark.yes_won, mark.source)
+        self._maybe_adapt(moment)
         self.save()
         return mark
 
@@ -329,10 +389,14 @@ class PaperSession:
         now = datetime.now(timezone.utc)
         payload = self.to_payload(now)
         _atomic_json(directory / "state.json", payload)
-        _atomic_json(self.root / "current.json", {"session_id": self.session_id})
+        metrics = payload.get("view", {}).get("metrics")
+        if isinstance(metrics, dict):
+            _atomic_json(directory / "metrics.json", metrics)
+        _atomic_json(self.root / "current.json", {"session_id": self.session_id, "arm": self.arm})
         self._last_save_mono = time.monotonic()
 
     def to_payload(self, now: datetime) -> dict[str, Any]:
+        self._track_equity()
         return {
             "session_id": self.session_id,
             "started_at": self.started_at.isoformat(),
@@ -352,6 +416,20 @@ class PaperSession:
             ],
             "last_entry_ms": self.last_entry_ms,
             "settled_at_adapt": self.settled_at_adapt,
+            "learn_exit_orders": self.learn_exit_orders,
+            "arm": self.arm,
+            "min_closes": self.min_closes,
+            "drawdown_stop": _num(self.drawdown_stop),
+            "finished": self.finished,
+            "stop_reason": self.stop_reason,
+            "equity_peak": format(self.equity_peak, "f"),
+            "max_drawdown": format(self.max_drawdown, "f"),
+            "max_open": self.max_open,
+            "predictions": self.predictions,
+            "label_watch": [
+                {"ticker": item.ticker, "deadline": item.deadline.isoformat()}
+                for item in self.label_watch
+            ],
             "learner": self.learner.to_dict(),
             "mark_guard": self.mark_guard,
             "closes_since_loosen": self._closes_since_loosen,
@@ -390,6 +468,10 @@ class PaperSession:
         return {
             "session_id": self.session_id,
             "trade_env": "paper",
+            "arm": self.arm,
+            "arm_label": _arm_label(self.arm),
+            "learn_exit_orders": self.learn_exit_orders,
+            "learner_influences": learner_influences(learn_exit_orders=self.learn_exit_orders),
             "strategy": self.params.name,
             "target_return": format(self.target_return, "f"),
             "target_note": "Aspirational KPI only. Not a forecast or a guarantee.",
@@ -419,6 +501,11 @@ class PaperSession:
                 book=self.book,
             )[:_VIEW_CLOSED],
             "fills": _fill_rows(self.account.ledger)[:_VIEW_FILLS],
+            "min_closes": self.min_closes,
+            "drawdown_stop": _num(self.drawdown_stop),
+            "finished": self.finished,
+            "stop_reason": self.stop_reason,
+            "metrics": self._metrics(now),
             "fee_model": (
                 "quadratic taker 0.07*C*P*(1-P) rounded up to $0.000001; "
                 "maker 0; in-window sells pay the same taker fee; "
@@ -454,6 +541,18 @@ class PaperSession:
         account = PaperAccount(bankroll, ledger)
         account.cash = Decimal(str(payload["cash"]))
         account.mark_credited()
+        if "learn_exit_orders" in payload:
+            learn_exit_orders = bool(payload["learn_exit_orders"])
+            arm = str(payload.get("arm") or ("ref" if learn_exit_orders else "no_learn_exit"))
+            finished_known = "finished" in payload
+        else:
+            learn_exit_orders = True
+            arm = "legacy"
+            finished_known = False
+        raw_stop = payload.get("drawdown_stop")
+        drawdown_stop = None if raw_stop in (None, "") else Decimal(str(raw_stop))
+        raw_min = payload.get("min_closes")
+        min_closes = None if raw_min is None else int(raw_min)
         session = cls(
             root,
             session_id=str(payload["session_id"]),
@@ -463,7 +562,24 @@ class PaperSession:
             target_return=Decimal(str(payload["target_return"])),
             account=account,
             params=StrategyParams.from_dict(payload["params"]),
+            learn_exit_orders=learn_exit_orders,
+            arm=arm,
+            min_closes=min_closes,
+            drawdown_stop=drawdown_stop,
         )
+        session.finished_known = finished_known
+        session.finished = bool(payload.get("finished")) if finished_known else False
+        session.stop_reason = payload.get("stop_reason")
+        session.equity_peak = Decimal(str(payload.get("equity_peak") or payload["bankroll"]))
+        session.max_drawdown = Decimal(str(payload.get("max_drawdown") or "0"))
+        session.max_open = int(payload.get("max_open") or 0)
+        predictions = payload.get("predictions") or []
+        session.predictions = [row for row in predictions if isinstance(row, dict)]
+        session.label_watch = [
+            LabelWatch(ticker=str(row["ticker"]), deadline=_parse_dt(str(row["deadline"])))
+            for row in payload.get("label_watch") or []
+            if isinstance(row, dict) and row.get("ticker") and row.get("deadline")
+        ]
         session.last_entry_ms = payload.get("last_entry_ms")
         session.settled_at_adapt = int(payload.get("settled_at_adapt") or 0)
         session.learner = OnlineLearner.from_dict(payload.get("learner"))
@@ -661,13 +777,14 @@ class PaperSession:
             reference_ticker=self.ticker,
         )
         stamp = ts_ms if ts_ms is not None else int(now.timestamp() * 1000)
+        self._stamp_open_entries(signal, stamp)
         self._cancel_wrong(signal)
         self._exit_open(signal, stamp, now)
         plan = self._entry_plan(signal, stamp)
         if plan is None:
             return
         features = market_features(signal, self.book, plan.outcome, plan.style, plan.limit)
-        self._submit(plan, ts_ms, features)
+        self._submit(plan, ts_ms, features, signal, stamp)
 
     def _entry_plan(self, signal: Signal, stamp: int) -> EntryPlan | None:
         if self.ticker is None:
@@ -739,6 +856,7 @@ class PaperSession:
             avg = buy_cost / bought if bought > 0 else intent.price
             features = market_features(signal, self.book, intent.outcome, intent.style, avg)
             held = None if intent.opened_ms is None else stamp - intent.opened_ms
+            learned_signal = self.learner.wants_exit(features)
             plan = decide_exit(
                 signal,
                 self.params,
@@ -746,7 +864,7 @@ class PaperSession:
                 outcome=intent.outcome,
                 filled=qty,
                 avg_price=avg,
-                learn_exit=self.learner.wants_exit(features),
+                learn_exit=learned_signal and self.learn_exit_orders,
                 held_ms=held,
             )
             if plan is None:
@@ -775,12 +893,20 @@ class PaperSession:
             )
             if intent.status != "closed":
                 continue
+            self._record_exit(intent, signal, stamp, plan.reason, learned_signal)
             self.last_entry_ms = stamp
             self._learn(intent, plan.reason)
             self._maybe_adapt(now)
             self.save()
 
-    def _submit(self, plan: EntryPlan, ts_ms: int | None, features: list[float]) -> None:
+    def _submit(
+        self,
+        plan: EntryPlan,
+        ts_ms: int | None,
+        features: list[float],
+        signal: Signal,
+        stamp: int,
+    ) -> None:
         if self.ticker is None:
             return
         intent = PaperIntent(
@@ -799,6 +925,7 @@ class PaperSession:
             if not intent.fills:
                 self.account.ledger.intents.pop()
                 return
+            self._stamp_entry(intent, signal, stamp)
         elif plan.style == "maker":
             pass
         else:
@@ -931,6 +1058,178 @@ class PaperSession:
         log.info("%s", change.reason)
         self.save()
 
+    def _schedule_done(self, now: datetime) -> bool:
+        """Stop after the clock, and after ``min_closes`` when that floor is set."""
+        if now < self.ends_at:
+            return False
+        if self.min_closes is None:
+            return True
+        return self._close_count() >= self.min_closes
+
+    def _drawdown_hit(self) -> bool:
+        if self.drawdown_stop is None:
+            return False
+        self._track_equity()
+        dd = self.bankroll - self.account.equity(self.book)
+        if dd < 0:
+            return False
+        return dd > self.drawdown_stop
+
+    def _close_count(self) -> int:
+        return sum(
+            1
+            for intent in self.account.ledger.intents
+            if intent.status in ("closed", "settled") and intent.fills and intent.pnl is not None
+        )
+
+    def _track_equity(self) -> None:
+        equity = self.account.equity(self.book)
+        if equity > self.equity_peak:
+            self.equity_peak = equity
+        drawdown = self.equity_peak - equity
+        if drawdown > self.max_drawdown:
+            self.max_drawdown = drawdown
+        open_n = sum(
+            1
+            for intent in self.account.ledger.intents
+            if intent.status == "open" and net_open_qty(intent) > 0
+        )
+        if open_n > self.max_open:
+            self.max_open = open_n
+
+    def _metrics(self, now: datetime) -> dict[str, Any]:
+        self._track_equity()
+        return session_metrics(
+            self.account.ledger.intents,
+            bankroll=self.bankroll,
+            equity=self.account.equity(self.book),
+            equity_peak=self.equity_peak,
+            max_drawdown=self.max_drawdown,
+            max_open=self.max_open,
+            learn_exit_orders=self.learn_exit_orders,
+            predictions=self.predictions,
+            now_ms=int(now.timestamp() * 1000),
+        )
+
+    def _stamp_open_entries(self, signal: Signal, stamp: int) -> None:
+        for intent in self.account.ledger.intents:
+            if intent.status != "open" or intent.entry_quote is not None:
+                continue
+            if net_open_qty(intent) <= 0:
+                continue
+            self._stamp_entry(intent, signal, stamp)
+
+    def _stamp_entry(self, intent: PaperIntent, signal: Signal, stamp: int) -> None:
+        if intent.entry_quote is not None or intent.opened_ms is None:
+            return
+        bought, _sold, buy_cost, *_rest = position_legs(intent)
+        if bought <= 0:
+            return
+        avg = buy_cost / bought
+        features = intent.entry_features or market_features(
+            signal, self.book, intent.outcome, intent.style, avg
+        )
+        learned = self.learner.wants_exit(features)
+        quote = build_quote(
+            signal,
+            self.book,
+            self.params,
+            outcome=intent.outcome,
+            style=intent.style,
+            price=avg,
+            avg_price=avg,
+            held_ms=0,
+            learned=learned,
+            learner_p=self.learner.predict(features),
+            ts_ms=intent.opened_ms if intent.opened_ms is not None else stamp,
+            filled=bought,
+        )
+        intent.entry_quote = quote
+        self._remember_prediction(intent, quote)
+
+    def _record_exit(
+        self,
+        intent: PaperIntent,
+        signal: Signal | None,
+        stamp: int,
+        reason: str,
+        learned_signal: bool,
+    ) -> None:
+        if intent.exit_delta is not None:
+            return
+        hold = None if intent.opened_ms is None else stamp - intent.opened_ms
+        exit_mark: dict[str, Any] | None = None
+        if signal is not None:
+            bought, _sold, buy_cost, *_rest = position_legs(intent)
+            avg = buy_cost / bought if bought > 0 else intent.price
+            features = market_features(signal, self.book, intent.outcome, intent.style, avg)
+            exit_mark = build_quote(
+                signal,
+                self.book,
+                self.params,
+                outcome=intent.outcome,
+                style=intent.style,
+                price=avg,
+                avg_price=avg,
+                held_ms=hold,
+                learned=learned_signal,
+                learner_p=self.learner.predict(features),
+                ts_ms=stamp,
+                filled=bought if bought > 0 else Decimal("1"),
+            )
+            intent.exit_quote = exit_mark
+        intent.exit_delta = build_delta(
+            intent.entry_quote,
+            exit_mark,
+            reason=reason,
+            hold_ms=hold,
+            learn_exit_orders=self.learn_exit_orders,
+            learned_signal=learned_signal,
+        )
+
+    def _remember_prediction(self, intent: PaperIntent, quote: dict[str, Any]) -> None:
+        for row in self.predictions:
+            if (
+                row.get("ticker") == intent.market_ticker
+                and row.get("opened_ms") == intent.opened_ms
+                and row.get("outcome") == intent.outcome
+            ):
+                return
+        self.predictions.append(prediction_row(intent, quote))
+        self._watch_label(intent.market_ticker)
+
+    def _watch_label(self, ticker: str) -> None:
+        for item in self.label_watch:
+            if item.ticker == ticker:
+                return
+        close_at = parse_kxbtc15m_close(ticker)
+        now = datetime.now(timezone.utc)
+        deadline = (close_at + _OFFICIAL_WAIT) if close_at is not None else (now + _OFFICIAL_WAIT)
+        self.label_watch.append(LabelWatch(ticker=ticker, deadline=deadline))
+
+    def _poll_labels(self, now: datetime) -> None:
+        if self.lookup is None:
+            return
+        still: list[LabelWatch] = []
+        for item in self.label_watch:
+            if item.next_poll is not None and now < item.next_poll:
+                still.append(item)
+                continue
+            item.next_poll = now + _POLL_EVERY
+            official = self.lookup.official_result(item.ticker)
+            if official == "yes" or official == "no":
+                self._apply_settlement_label(item.ticker, official == "yes", "official")
+                continue
+            if now >= item.deadline:
+                continue
+            still.append(item)
+        self.label_watch = still
+
+    def _apply_settlement_label(self, ticker: str, yes_won: bool, source: str) -> None:
+        stamp_settlement(self.predictions, ticker, yes_won=yes_won, source=source)
+        if source == "official":
+            self.label_watch = [item for item in self.label_watch if item.ticker != ticker]
+
     def _learn(self, intent: PaperIntent, reason: str) -> None:
         if intent.pnl is None or not intent.entry_features:
             return
@@ -960,6 +1259,37 @@ class PaperSession:
         return None
 
 
+def _arm_for(learn_exit_orders: bool, arm: str | None) -> str:
+    if arm is None:
+        return "ref" if learn_exit_orders else "no_learn_exit"
+    if arm == "legacy":
+        if not learn_exit_orders:
+            raise ValueError("legacy sessions keep learned-exit orders enabled")
+        return arm
+    if arm == "ref" and learn_exit_orders:
+        return arm
+    if arm == "no_learn_exit" and not learn_exit_orders:
+        return arm
+    raise ValueError(f"arm {arm!r} does not match learn_exit_orders={learn_exit_orders}")
+
+
+def _arm_label(arm: str) -> str:
+    if arm == "ref":
+        return "REF"
+    if arm == "no_learn_exit":
+        return "NO_LEARN_EXIT"
+    if arm == "legacy":
+        return "LEGACY"
+    raise ValueError(f"unknown arm {arm!r}")
+
+
+def _should_resume(existing: PaperSession, now: datetime) -> bool:
+    """Keep a forwardtest that is waiting on min_closes after the clock."""
+    if existing.finished_known:
+        return not existing.finished
+    return existing.ends_at > now
+
+
 def assert_paper_only(trade_env: str) -> None:
     if trade_env != "paper":
         raise RuntimeError(
@@ -975,6 +1305,9 @@ def run_paper_session(
     jsonl_path: Path,
     session_root: Path = DEFAULT_SESSION_ROOT,
     settings: Settings | None = None,
+    learn_exit_orders: bool = True,
+    min_closes: int | None = None,
+    drawdown_stop: Decimal | None = None,
 ) -> int:
     """Tail ``jsonl_path`` until the session clock ends. Paper fills stay local."""
     trade_env = settings.trade_env if settings is not None else "paper"
@@ -994,8 +1327,22 @@ def run_paper_session(
             log.warning("official results unavailable; reconstructed BRTI is the fallback")
         now = datetime.now(timezone.utc)
         existing = _load_quiet(session_root)
-        if existing is not None and existing.ends_at > now:
+        if existing is not None and _should_resume(existing, now):
             session = existing
+            if session.learn_exit_orders != learn_exit_orders:
+                raise RuntimeError(
+                    f"session {session.session_id} has learn_exit_orders={session.learn_exit_orders}; "
+                    f"this process asked for {learn_exit_orders}. Use a new session directory."
+                )
+            if session.min_closes != min_closes or session.drawdown_stop != drawdown_stop:
+                log.warning(
+                    "resuming %s keeps min_closes=%s drawdown_stop=%s (CLI was %s / %s)",
+                    session.session_id,
+                    session.min_closes,
+                    session.drawdown_stop,
+                    min_closes,
+                    drawdown_stop,
+                )
             if session.bankroll != bankroll or session.target_return != target_return:
                 log.warning(
                     "resuming %s bankroll %s target %s (flags were %s / %s)",
@@ -1013,6 +1360,9 @@ def run_paper_session(
                 hours=hours,
                 target_return=target_return,
                 now=now,
+                learn_exit_orders=learn_exit_orders,
+                min_closes=min_closes,
+                drawdown_stop=drawdown_stop,
             )
             log.info("started paper session %s", session.session_id)
         session.lookup = lookup
@@ -1023,6 +1373,21 @@ def run_paper_session(
         if lookup is not None:
             lookup.close()
         lock.release()
+
+
+def paper_session_dirs(primary: Path = DEFAULT_SESSION_ROOT) -> list[Path]:
+    """Legacy session plus the two forwardtest arms, when those directories exist."""
+    dirs = [primary]
+    for name in (AB_REF_DIR, AB_NOLEARN_DIR):
+        child = primary / name
+        if child not in dirs:
+            dirs.append(child)
+    return dirs
+
+
+def ab_arm_dirs(root: Path) -> tuple[Path, Path]:
+    """Isolated roots. Neither path is ``root`` itself, so an old session stays put."""
+    return root / AB_REF_DIR, root / AB_NOLEARN_DIR
 
 
 def read_session_view(root: Path = DEFAULT_SESSION_ROOT) -> dict[str, Any] | None:
@@ -1041,6 +1406,7 @@ def read_session_view(root: Path = DEFAULT_SESSION_ROOT) -> dict[str, Any] | Non
             return None
         shown = dict(view)
         shown["running"] = session_running(root)
+        shown["session_dir"] = str(root)
         return shown
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -1152,10 +1518,21 @@ def _install_signals(session: PaperSession) -> None:
 
 def _print_banner(session: PaperSession, jsonl_path: Path, trade_env: str) -> None:
     print(f"session:       {session.session_id}")
+    print(f"arm:           {_arm_label(session.arm)}")
+    print(f"learn_exit_orders: {str(session.learn_exit_orders).lower()}")
+    print(
+        "still active:  training, adjust_params, rolling/mark adapt, "
+        "size/cooldown, stop, signal_flip, take_profit, edge_gone, settlement"
+    )
     print(f"bankroll:      {format(session.bankroll, 'f')}")
     print(f"target_return: {format(session.target_return, 'f')} (aspirational, not a forecast)")
     print(f"ends:          {_ams(session.ends_at)}")
+    if session.min_closes is not None:
+        print(f"min_closes:    {session.min_closes} (keeps running past the clock until both are met)")
+    if session.drawdown_stop is not None:
+        print(f"drawdown_stop: {format(session.drawdown_stop, 'f')} from bankroll")
     print(f"jsonl:         {jsonl_path}")
+    print(f"state:         {session.root}")
     print(f"trade_env:     {trade_env}")
     print("orders:        none (local fills only)")
 
@@ -1195,9 +1572,12 @@ def _trade_rows(
         if first_ts is None:
             first_ts = next((fill.ts_ms for fill in intent.fills if fill.ts_ms is not None), None)
         last_ts = next((fill.ts_ms for fill in reversed(intent.fills) if fill.ts_ms is not None), None)
-        hold_s = None
-        if first_ts is not None and last_ts is not None and last_ts >= first_ts:
-            hold_s = (last_ts - first_ts) / 1000.0
+        hold_ms = None
+        if intent.exit_delta and intent.exit_delta.get("hold_ms") is not None:
+            hold_ms = int(intent.exit_delta["hold_ms"])
+        elif first_ts is not None and last_ts is not None and last_ts >= first_ts:
+            hold_ms = last_ts - first_ts
+        hold_s = None if hold_ms is None else hold_ms / 1000.0
         mark = _position_mark(book, intent)
         unrealized = None
         if intent.status == "open" and mark is not None and bought > 0 and net > 0:
@@ -1218,6 +1598,8 @@ def _trade_rows(
                 "won": intent.won,
                 "pnl": _num(intent.pnl),
                 "exit_reason": intent.exit_reason,
+                "hold_ms": hold_ms,
+                "exit_delta": intent.exit_delta,
                 "mark": _num(mark) if intent.status == "open" else None,
                 "unrealized": _num(unrealized),
                 "hold_s": hold_s,
@@ -1297,6 +1679,9 @@ def _intent_dict(intent: PaperIntent) -> dict[str, Any]:
         "pnl": _num(intent.pnl),
         "exit_reason": intent.exit_reason,
         "entry_features": intent.entry_features,
+        "entry_quote": intent.entry_quote,
+        "exit_quote": intent.exit_quote,
+        "exit_delta": intent.exit_delta,
         "opened_ms": intent.opened_ms,
         "fills": [
             {
@@ -1330,6 +1715,9 @@ def _intent_from(raw: dict[str, Any]) -> PaperIntent:
     intent.pnl = _dec(raw.get("pnl"))
     intent.exit_reason = raw.get("exit_reason")
     intent.entry_features = [float(value) for value in raw.get("entry_features") or []]
+    intent.entry_quote = raw.get("entry_quote") if isinstance(raw.get("entry_quote"), dict) else None
+    intent.exit_quote = raw.get("exit_quote") if isinstance(raw.get("exit_quote"), dict) else None
+    intent.exit_delta = raw.get("exit_delta") if isinstance(raw.get("exit_delta"), dict) else None
     intent.opened_ms = raw.get("opened_ms")
     intent.fills = [
         PaperFill(

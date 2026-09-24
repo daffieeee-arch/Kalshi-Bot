@@ -67,6 +67,9 @@ class PaperIntent:
     exit_reason: str | None = None
     entry_features: list[float] = field(default_factory=list)
     opened_ms: int | None = None
+    entry_quote: dict[str, Any] | None = None
+    exit_quote: dict[str, Any] | None = None
+    exit_delta: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.remaining = self.count

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from kalshi_bot.config import load_settings
 from kalshi_bot.dashboard.feed import LiveFeed
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
-from kalshi_bot.session import DEFAULT_SESSION_ROOT
+from kalshi_bot.session import DEFAULT_SESSION_ROOT, paper_session_dirs
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -25,13 +25,16 @@ def create_app(
     jsonl_path: Path = DEFAULT_JSONL,
     lock_path: Path = DEFAULT_LOCK,
     session_dir: Path = DEFAULT_SESSION_ROOT,
+    session_dirs: list[Path] | None = None,
 ) -> FastAPI:
     settings = load_settings()
+    dirs = session_dirs if session_dirs is not None else paper_session_dirs(session_dir)
     feed = LiveFeed(
         jsonl_path=jsonl_path,
         lock_path=lock_path,
         settings=settings,
         session_dir=session_dir,
+        session_dirs=dirs,
     )
 
     @asynccontextmanager

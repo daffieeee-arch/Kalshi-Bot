@@ -17,7 +17,7 @@ from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import is_currently_open, parse_kxbtc15m_close, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
-from kalshi_bot.session import DEFAULT_SESSION_ROOT, read_session_view
+from kalshi_bot.session import DEFAULT_SESSION_ROOT, paper_session_dirs, read_session_view
 from kalshi_bot.signal import evaluate, sigma_from_samples, signal_to_dict
 
 _DISCOVER_INTERVAL_S = 15.0
@@ -43,6 +43,15 @@ STREAM_LABELS = {
 }
 
 
+def _session_views(dirs: list[Path]) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    for path in dirs:
+        view = read_session_view(path)
+        if view is not None:
+            views.append(view)
+    return views
+
+
 def _levels(book: dict[Decimal, Decimal], *, reverse: bool) -> list[list[str]]:
     keys = sorted(book, reverse=reverse)
     return [[format(price, "f"), format(book[price], "f")] for price in keys]
@@ -63,11 +72,13 @@ class LiveFeed:
         lock_path: Path = DEFAULT_LOCK,
         settings: Settings | None = None,
         session_dir: Path = DEFAULT_SESSION_ROOT,
+        session_dirs: list[Path] | None = None,
     ) -> None:
         self.jsonl_path = jsonl_path
         self.lock_path = lock_path
         self.settings = settings
         self.session_dir = session_dir
+        self.session_dirs = session_dirs if session_dirs is not None else paper_session_dirs(session_dir)
         self.book = OrderbookState()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -157,7 +168,10 @@ class LiveFeed:
                 "streams": _stream_view(self._counts, rates),
                 "last_row_at": self._last_row_at,
             }
-        payload["paper_session"] = read_session_view(self.session_dir)
+        views = _session_views(self.session_dirs)
+        primary = read_session_view(self.session_dir)
+        payload["paper_sessions"] = views
+        payload["paper_session"] = primary if primary is not None else (views[0] if views else None)
         return payload
 
     def _run(self) -> None:

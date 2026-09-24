@@ -200,7 +200,7 @@ def decide(
     )
 
 
-def decide_exit(
+def exit_flags(
     signal: Signal,
     params: StrategyParams,
     book: OrderbookState,
@@ -208,15 +208,13 @@ def decide_exit(
     outcome: Side,
     filled: Decimal,
     avg_price: Decimal,
-    learn_exit: bool,
+    learned: bool,
     held_ms: int | None = None,
-) -> ExitPlan | None:
-    """Close a live position, or keep it for settlement.
+) -> dict[str, bool] | None:
+    """Independent exit predicates. None when the book cannot support an exit.
 
-    Order is signal flip, adverse mid, a learned loss pattern, edge gone
-    (bid through the model after the taker fee), then a realizable take-profit.
-    A stop waits two seconds so the entry spread itself is not the stop.
-    A stale or closed book does not exit.
+    ``learned`` is the raw learner vote. The session may still refuse to act
+    on it. A stop waits two seconds so the entry spread itself is not the stop.
     """
     if filled <= 0 or signal.model_yes is None or signal.note in _BLOCK_NOTES:
         return None
@@ -233,15 +231,54 @@ def decide_exit(
     fee = quadratic_taker_fee(Decimal("1"), bid)
     flip_at = Decimal("0.5") - params.flip_margin
     stop_ready = held_ms is None or held_ms >= 2000
-    if model < flip_at:
+    return {
+        "signal_flip": model < flip_at,
+        "stop": bool(stop_ready and mid <= avg_price - params.stop_loss),
+        "learned": learned,
+        "edge_gone": bid - fee >= model,
+        "take_profit": bid >= avg_price + params.take_profit,
+    }
+
+
+def decide_exit(
+    signal: Signal,
+    params: StrategyParams,
+    book: OrderbookState,
+    *,
+    outcome: Side,
+    filled: Decimal,
+    avg_price: Decimal,
+    learn_exit: bool,
+    held_ms: int | None = None,
+) -> ExitPlan | None:
+    """Close a live position, or keep it for settlement.
+
+    Order is signal flip, adverse mid, a learned loss pattern, edge gone
+    (bid through the model after the taker fee), then a realizable take-profit.
+    ``learn_exit`` is whether a learned exit may place an order. A stale or
+    closed book does not exit.
+    """
+    flags = exit_flags(
+        signal,
+        params,
+        book,
+        outcome=outcome,
+        filled=filled,
+        avg_price=avg_price,
+        learned=learn_exit,
+        held_ms=held_ms,
+    )
+    if flags is None:
+        return None
+    if flags["signal_flip"]:
         reason = "signal_flip"
-    elif stop_ready and mid <= avg_price - params.stop_loss:
+    elif flags["stop"]:
         reason = "stop"
-    elif learn_exit:
+    elif flags["learned"]:
         reason = "learned"
-    elif bid - fee >= model:
+    elif flags["edge_gone"]:
         reason = "edge_gone"
-    elif bid >= avg_price + params.take_profit:
+    elif flags["take_profit"]:
         reason = "take_profit"
     else:
         return None
