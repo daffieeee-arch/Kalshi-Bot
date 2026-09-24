@@ -28,17 +28,29 @@ from kalshi_bot.account import PaperAccount
 from kalshi_bot.client import KalshiReadClient
 from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import parse_kxbtc15m_close
+from kalshi_bot.learn import MIN_INFLUENCE, OnlineLearner
 from kalshi_bot.orderbook import OrderbookState, Side
-from kalshi_bot.paper import PaperFill, PaperIntent, PaperLedger, SettlementMark
+from kalshi_bot.paper import (
+    PaperFill,
+    PaperIntent,
+    PaperLedger,
+    SettlementMark,
+    net_open_qty,
+    position_legs,
+)
 from kalshi_bot.recorder import brti_close_average_belongs, brti_settlement_matches
-from kalshi_bot.signal import evaluate, sigma_from_samples
+from kalshi_bot.signal import Signal, evaluate, sigma_from_samples
 from kalshi_bot.strategy import (
     Adaptation,
     EntryPlan,
     StrategyParams,
     adapt,
+    adapt_to_mark,
+    cancel_reason,
     decide,
+    decide_exit,
     initial_params,
+    market_features,
     rolling_score_from_pnls,
 )
 
@@ -56,6 +68,7 @@ _META_NEEDLES = (b'"stream":"market_meta"', b'"stream": "market_meta"')
 _VIEW_FILLS = 40
 _VIEW_CLOSED = 40
 _VIEW_ADAPTATIONS = 12
+_MARK_ADAPT_S = 30.0
 
 OfficialResult = Literal["yes", "no"]
 
@@ -129,9 +142,13 @@ class PaperSession:
         self.target_return = target_return
         self.account = account
         self.params = params
+        self.learner = OnlineLearner.cold()
         self.adaptations: list[tuple[str, Adaptation]] = []
         self.last_entry_ms: int | None = None
         self.settled_at_adapt = 0
+        self.mark_guard: str | None = None
+        self._closes_since_loosen = 0
+        self._last_mark_adapt_mono: float | None = None
         self.jsonl_offset = 0
         self.book = OrderbookState()
         self.spots: deque[tuple[int | None, Decimal]] = deque(maxlen=_SPOT_WINDOW)
@@ -220,6 +237,7 @@ class PaperSession:
             try:
                 self._pump(path)
                 self.poll_official(now)
+                self._maybe_mark_adapt(now)
                 if time.monotonic() - self._last_save_mono >= 1.0:
                     self.save()
             except Exception as exc:  # noqa: BLE001 — a 24h loop must survive one bad line
@@ -276,6 +294,11 @@ class PaperSession:
         strike: Decimal | None,
         now: datetime | None = None,
     ) -> SettlementMark | None:
+        watched = [
+            intent
+            for intent in self.account.ledger.intents
+            if intent.market_ticker == ticker and intent.status == "open"
+        ]
         mark = self.account.ledger.on_settlement(
             market_ticker=ticker,
             close_avg=close_avg,
@@ -293,6 +316,9 @@ class PaperSession:
             format(paid, "f"),
             mark.mismatch,
         )
+        for intent in watched:
+            if intent.status == "settled":
+                self._learn(intent, intent.exit_reason or "settlement")
         self._maybe_adapt(now or datetime.now(timezone.utc))
         self.save()
         return mark
@@ -326,6 +352,9 @@ class PaperSession:
             ],
             "last_entry_ms": self.last_entry_ms,
             "settled_at_adapt": self.settled_at_adapt,
+            "learner": self.learner.to_dict(),
+            "mark_guard": self.mark_guard,
+            "closes_since_loosen": self._closes_since_loosen,
             "jsonl_offset": self.jsonl_offset,
             "taken": [
                 {
@@ -382,12 +411,18 @@ class PaperSession:
             "seconds_left": max(0.0, seconds_left),
             "params": self.params.to_dict(),
             "adaptations": _adaptation_rows(self.adaptations),
-            "open_trades": _trade_rows(self.account.ledger, status="open"),
-            "closed_trades": _trade_rows(self.account.ledger, status="settled")[:_VIEW_CLOSED],
+            "learner": self.learner.summary(),
+            "open_trades": _trade_rows(self.account.ledger, statuses=("open",), book=self.book),
+            "closed_trades": _trade_rows(
+                self.account.ledger,
+                statuses=("settled", "closed"),
+                book=self.book,
+            )[:_VIEW_CLOSED],
             "fills": _fill_rows(self.account.ledger)[:_VIEW_FILLS],
             "fee_model": (
                 "quadratic taker 0.07*C*P*(1-P) rounded up to $0.000001; "
-                "maker 0; yes/no settlement $1 per winning contract, fee 0"
+                "maker 0; in-window sells pay the same taker fee; "
+                "yes/no settlement $1 per winning contract, fee 0"
             ),
         }
 
@@ -431,6 +466,9 @@ class PaperSession:
         )
         session.last_entry_ms = payload.get("last_entry_ms")
         session.settled_at_adapt = int(payload.get("settled_at_adapt") or 0)
+        session.learner = OnlineLearner.from_dict(payload.get("learner"))
+        session.mark_guard = payload.get("mark_guard")
+        session._closes_since_loosen = int(payload.get("closes_since_loosen") or 0)
         session.jsonl_offset = int(payload.get("jsonl_offset") or 0)
         session.adaptations = [
             (
@@ -525,7 +563,7 @@ class PaperSession:
             self._on_delta(payload, live=True, ts_ms=ts_ms, now=now)
         elif stream == "trade":
             self._note(self.account.ledger.on_trade(payload))
-            self._maybe_enter(ts_ms, now)
+            self._on_quote(ts_ms, now)
         elif stream == "cfbenchmarks_value":
             self._on_brti(payload.get("msg") or {}, ts_ms=ts_ms, live=True, now=now)
 
@@ -557,7 +595,7 @@ class PaperSession:
             self.close_window = None
         if live:
             self._note(self.account.ledger.on_book(self.book, ts_ms=ts_ms))
-            self._maybe_enter(ts_ms, now)
+            self._on_quote(ts_ms, now)
 
     def _on_delta(self, payload: dict[str, Any], *, live: bool, ts_ms: int | None, now: datetime) -> None:
         previous = self.book.market_ticker
@@ -570,7 +608,7 @@ class PaperSession:
             self.close_window = None
         if live:
             self._note(self.account.ledger.on_book(self.book, ts_ms=ts_ms))
-            self._maybe_enter(ts_ms, now)
+            self._on_quote(ts_ms, now)
 
     def _on_brti(
         self,
@@ -600,9 +638,9 @@ class PaperSession:
                     if brti_settlement_matches(item.ticker, close, event_ts_ms=ts_ms):
                         self._watch(item.ticker, item.strike, Decimal(str(close["value"])), now)
         if live:
-            self._maybe_enter(ts_ms, now)
+            self._on_quote(ts_ms, now)
 
-    def _maybe_enter(self, ts_ms: int | None, now: datetime) -> None:
+    def _on_quote(self, ts_ms: int | None, now: datetime) -> None:
         if not self.armed or now >= self.ends_at or not self.ticker:
             return
         self._ensure_strike()
@@ -623,9 +661,37 @@ class PaperSession:
             reference_ticker=self.ticker,
         )
         stamp = ts_ms if ts_ms is not None else int(now.timestamp() * 1000)
-        plan = decide(
+        self._cancel_wrong(signal)
+        self._exit_open(signal, stamp, now)
+        plan = self._entry_plan(signal, stamp)
+        if plan is None:
+            return
+        features = market_features(signal, self.book, plan.outcome, plan.style, plan.limit)
+        self._submit(plan, ts_ms, features)
+
+    def _entry_plan(self, signal: Signal, stamp: int) -> EntryPlan | None:
+        if self.ticker is None:
+            return None
+        plan = self._decide(signal, self.params, stamp)
+        if plan is None or self.learner.n < MIN_INFLUENCE:
+            return plan
+        features = market_features(signal, self.book, plan.outcome, plan.style, plan.limit)
+        tuned = self.learner.adjust_params(self.params, features)
+        if tuned == self.params:
+            return plan
+        revised = self._decide(signal, tuned, stamp)
+        if revised is None:
+            return None
+        features = market_features(signal, self.book, revised.outcome, revised.style, revised.limit)
+        tuned = self.learner.adjust_params(self.params, features)
+        return self._decide(signal, tuned, stamp)
+
+    def _decide(self, signal: Signal, params: StrategyParams, stamp: int) -> EntryPlan | None:
+        if self.ticker is None:
+            return None
+        return decide(
             signal,
-            self.params,
+            params,
             self.book,
             available_cash=self.account.available_cash(),
             open_risk=self.account.open_risk(),
@@ -634,11 +700,87 @@ class PaperSession:
             close_window=self.close_window,
             ticker_busy=_ticker_busy(self.account.ledger, self.ticker),
         )
-        if plan is None:
-            return
-        self._submit(plan, ts_ms)
 
-    def _submit(self, plan: EntryPlan, ts_ms: int | None) -> None:
+    def _cancel_wrong(self, signal: Signal) -> None:
+        if self.ticker is None:
+            return
+        for intent in self.account.ledger.intents:
+            if intent.status != "open" or intent.market_ticker != self.ticker or intent.remaining <= 0:
+                continue
+            reason = cancel_reason(
+                signal,
+                self.params,
+                outcome=intent.outcome,
+                style=intent.style,
+                price=intent.price,
+            )
+            if reason is None:
+                continue
+            if not self.account.ledger.cancel_resting(intent, reason):
+                continue
+            log.info(
+                "paper cancel %s %s %s remaining was resting",
+                reason,
+                intent.outcome,
+                intent.market_ticker,
+            )
+            self.save()
+
+    def _exit_open(self, signal: Signal, stamp: int, now: datetime) -> None:
+        if self.ticker is None:
+            return
+        for intent in self.account.ledger.intents:
+            if intent.status != "open" or intent.market_ticker != self.ticker:
+                continue
+            qty = net_open_qty(intent)
+            if qty <= 0:
+                continue
+            bought, _sold, buy_cost, *_rest = position_legs(intent)
+            avg = buy_cost / bought if bought > 0 else intent.price
+            features = market_features(signal, self.book, intent.outcome, intent.style, avg)
+            held = None if intent.opened_ms is None else stamp - intent.opened_ms
+            plan = decide_exit(
+                signal,
+                self.params,
+                self.book,
+                outcome=intent.outcome,
+                filled=qty,
+                avg_price=avg,
+                learn_exit=self.learner.wants_exit(features),
+                held_ms=held,
+            )
+            if plan is None:
+                continue
+            cancelled = self.account.ledger.cancel_resting(intent, plan.reason)
+            fills = self.account.ledger.sell_open(
+                intent,
+                self.book,
+                ts_ms=stamp,
+                min_price=plan.min_price,
+                reason=plan.reason,
+                slippage=plan.slippage,
+            )
+            self._note(fills)
+            if not fills:
+                if cancelled:
+                    self.save()
+                continue
+            log.info(
+                "paper exit %s %s %s reason %s (%s)",
+                intent.outcome,
+                format(sum((fill.count for fill in fills), Decimal("0")), "f"),
+                intent.market_ticker,
+                plan.reason,
+                "flat" if intent.status == "closed" else "partial",
+            )
+            if intent.status != "closed":
+                continue
+            self.last_entry_ms = stamp
+            self._learn(intent, plan.reason)
+            self._maybe_adapt(now)
+            self.save()
+
+    def _submit(self, plan: EntryPlan, ts_ms: int | None, features: list[float]) -> None:
         if self.ticker is None:
             return
         intent = PaperIntent(
@@ -648,6 +790,7 @@ class PaperSession:
             count=plan.count,
             style=plan.style,
         )
+        intent.entry_features = features
         self.account.ledger.add(intent)
         self.last_entry_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)
         if plan.style == "taker":
@@ -740,9 +883,10 @@ class PaperSession:
         return self.lookup.official_result(item.ticker)
 
     def _maybe_adapt(self, now: datetime) -> None:
-        pnls = _settled_pnls(self.account.ledger)
-        if len(pnls) - self.settled_at_adapt < 4:
-            return
+        """React to each close. Loosen at most once per four closes."""
+        self.mark_guard = None
+        pnls = _closed_pnls(self.account.ledger)
+        self._closes_since_loosen += 1
         change = adapt(
             self.params,
             score=rolling_score_from_pnls(pnls),
@@ -751,13 +895,52 @@ class PaperSession:
             target_return=self.target_return,
             elapsed_s=(now - self.started_at).total_seconds(),
             duration_s=(self.ends_at - self.started_at).total_seconds(),
+            allow_loosen=self._closes_since_loosen >= 4,
         )
         self.settled_at_adapt = len(pnls)
         if change is None:
             return
+        if change.reason.startswith("loosen"):
+            self._closes_since_loosen = 0
         self.params = change.after
         self.adaptations.append((now.isoformat(), change))
         log.info("%s", change.reason)
+
+    def _maybe_mark_adapt(self, now: datetime) -> None:
+        """At most one tighten per open position when the live mark is down."""
+        if not self.armed:
+            return
+        mono = time.monotonic()
+        if self._last_mark_adapt_mono is not None and mono - self._last_mark_adapt_mono < _MARK_ADAPT_S:
+            return
+        self._last_mark_adapt_mono = mono
+        key = _open_guard_key(self.account.ledger)
+        if key is None or self.mark_guard == key:
+            return
+        drawdown = max(Decimal("1"), (self.bankroll * Decimal("0.005")).quantize(Decimal("0.01")))
+        change = adapt_to_mark(
+            self.params,
+            unrealized=self.account.unrealized_pnl(self.book),
+            drawdown=drawdown,
+        )
+        if change is None:
+            return
+        self.mark_guard = key
+        self.params = change.after
+        self.adaptations.append((now.isoformat(), change))
+        log.info("%s", change.reason)
+        self.save()
+
+    def _learn(self, intent: PaperIntent, reason: str) -> None:
+        if intent.pnl is None or not intent.entry_features:
+            return
+        self.learner.update(
+            intent.entry_features,
+            won=intent.pnl > 0,
+            pnl=intent.pnl,
+            style=intent.style,
+            reason=reason,
+        )
 
     def _strike_for(self, ticker: str) -> Decimal | None:
         if ticker == self.ticker:
@@ -992,15 +1175,33 @@ def _adaptation_rows(rows: list[tuple[str, Adaptation]]) -> list[dict[str, Any]]
     return out
 
 
-def _trade_rows(ledger: PaperLedger, *, status: str) -> list[dict[str, Any]]:
+def _trade_rows(
+    ledger: PaperLedger,
+    *,
+    statuses: tuple[str, ...],
+    book: OrderbookState | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for intent in ledger.intents:
-        if intent.status != status:
+        if intent.status not in statuses:
             continue
-        filled = sum((fill.count for fill in intent.fills), Decimal("0"))
-        cost = sum((fill.price * fill.count for fill in intent.fills), Decimal("0"))
-        fee = sum((fill.fee for fill in intent.fills), Decimal("0"))
-        first_ts = next((fill.ts_ms for fill in intent.fills if fill.ts_ms is not None), None)
+        bought, sold, buy_cost, buy_fees, _proceeds, sell_fees = position_legs(intent)
+        net = bought - sold
+        if net < 0:
+            net = Decimal("0")
+        shown = net if intent.status == "open" else bought
+        fee = buy_fees + sell_fees
+        first_ts = intent.opened_ms
+        if first_ts is None:
+            first_ts = next((fill.ts_ms for fill in intent.fills if fill.ts_ms is not None), None)
+        last_ts = next((fill.ts_ms for fill in reversed(intent.fills) if fill.ts_ms is not None), None)
+        hold_s = None
+        if first_ts is not None and last_ts is not None and last_ts >= first_ts:
+            hold_s = (last_ts - first_ts) / 1000.0
+        mark = _position_mark(book, intent)
+        unrealized = None
+        if intent.status == "open" and mark is not None and bought > 0 and net > 0:
+            unrealized = mark * net - (buy_cost * net / bought) - (buy_fees * net / bought)
         rows.append(
             {
                 "ticker": intent.market_ticker,
@@ -1009,12 +1210,17 @@ def _trade_rows(ledger: PaperLedger, *, status: str) -> list[dict[str, Any]]:
                 "limit": format(intent.price, "f"),
                 "count": format(intent.count, "f"),
                 "remaining": format(intent.remaining, "f"),
-                "filled": format(filled, "f"),
-                "avg_price": format(cost / filled, "f") if filled > 0 else None,
+                "filled": format(shown, "f"),
+                "sold": format(sold, "f"),
+                "avg_price": format(buy_cost / bought, "f") if bought > 0 else None,
                 "fee": format(fee, "f"),
                 "status": intent.status,
                 "won": intent.won,
                 "pnl": _num(intent.pnl),
+                "exit_reason": intent.exit_reason,
+                "mark": _num(mark) if intent.status == "open" else None,
+                "unrealized": _num(unrealized),
+                "hold_s": hold_s,
                 "at_amsterdam": _ams_ms(first_ts),
             }
         )
@@ -1035,6 +1241,7 @@ def _fill_rows(ledger: PaperLedger) -> list[dict[str, Any]]:
                     "count": format(fill.count, "f"),
                     "fee": format(fill.fee, "f"),
                     "source": fill.source,
+                    "action": fill.action,
                     "at_amsterdam": _ams_ms(fill.ts_ms),
                 }
             )
@@ -1042,23 +1249,34 @@ def _fill_rows(ledger: PaperLedger) -> list[dict[str, Any]]:
     return rows
 
 
-def _settled_pnls(ledger: PaperLedger) -> list[Decimal]:
+def _closed_pnls(ledger: PaperLedger) -> list[Decimal]:
     return [
         intent.pnl
         for intent in ledger.intents
-        if intent.status == "settled" and intent.fills and intent.pnl is not None
+        if intent.status in ("settled", "closed") and intent.fills and intent.pnl is not None
     ]
 
 
 def _ticker_busy(ledger: PaperLedger, ticker: str) -> bool:
     for intent in ledger.intents:
-        if intent.market_ticker != ticker:
+        if intent.market_ticker != ticker or intent.status != "open":
             continue
-        if intent.fills:
-            return True
-        if intent.status == "open" and intent.remaining > 0:
+        if intent.remaining > 0 or net_open_qty(intent) > 0:
             return True
     return False
+
+
+def _open_guard_key(ledger: PaperLedger) -> str | None:
+    for intent in ledger.intents:
+        if intent.status == "open" and net_open_qty(intent) > 0:
+            return f"{intent.market_ticker}:{intent.opened_ms}"
+    return None
+
+
+def _position_mark(book: OrderbookState | None, intent: PaperIntent) -> Decimal | None:
+    if book is None or not book.valid or book.market_ticker != intent.market_ticker:
+        return None
+    return book.best_bid(intent.outcome)
 
 
 def _has_open(ledger: PaperLedger, ticker: str) -> bool:
@@ -1077,6 +1295,9 @@ def _intent_dict(intent: PaperIntent) -> dict[str, Any]:
         "settled": intent.settled,
         "won": intent.won,
         "pnl": _num(intent.pnl),
+        "exit_reason": intent.exit_reason,
+        "entry_features": intent.entry_features,
+        "opened_ms": intent.opened_ms,
         "fills": [
             {
                 "market_ticker": fill.market_ticker,
@@ -1087,6 +1308,7 @@ def _intent_dict(intent: PaperIntent) -> dict[str, Any]:
                 "fee": format(fill.fee, "f"),
                 "ts_ms": fill.ts_ms,
                 "source": fill.source,
+                "action": fill.action,
             }
             for fill in intent.fills
         ],
@@ -1106,6 +1328,9 @@ def _intent_from(raw: dict[str, Any]) -> PaperIntent:
     intent.settled = bool(raw.get("settled"))
     intent.won = raw.get("won")
     intent.pnl = _dec(raw.get("pnl"))
+    intent.exit_reason = raw.get("exit_reason")
+    intent.entry_features = [float(value) for value in raw.get("entry_features") or []]
+    intent.opened_ms = raw.get("opened_ms")
     intent.fills = [
         PaperFill(
             market_ticker=str(fill["market_ticker"]),
@@ -1116,6 +1341,7 @@ def _intent_from(raw: dict[str, Any]) -> PaperIntent:
             fee=Decimal(str(fill["fee"])),
             ts_ms=fill.get("ts_ms"),
             source=str(fill.get("source") or ""),
+            action=fill.get("action") or "buy",
         )
         for fill in raw.get("fills") or []
     ]

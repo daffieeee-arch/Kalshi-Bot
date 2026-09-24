@@ -114,15 +114,15 @@ On any machine in the Tailscale tailnet (Mac, phone, …):
 [https://chupa.tail9f5972.ts.net:8443](https://chupa.tail9f5972.ts.net:8443)
 (tailnet only; the existing `https://chupa.tail9f5972.ts.net/` app on :443 is unchanged).
 
-The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders. When a paper session is running, the same page shows equity, cash, realized and unrealized PnL, the blotter, strategy params, adaptation events, and the session countdown. Times on the page are Europe/Amsterdam.
+The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders. When a paper session is running, the same page shows equity, cash, realized and unrealized PnL, open marks, in-window exit reasons, the blotter, strategy params, adaptation events, the online learner (sample count and a few weights), and the session countdown. Times on the page are Europe/Amsterdam.
 
 ## 24-hour paper session
 
 `paper-btc-15m` is a second process. It does not open the production WebSocket and it does not send orders. Leave `record-btc-15m` and `dashboard-btc-15m` running; the paper process only tails `data/prod-kxbtc15m.jsonl`.
 
-`KXBTC15M` is fee type `quadratic` with multiplier 1 (verified via `GET /series/KXBTC15M`): taker fee `ceil_6dp(0.07 × C × P × (1−P))`, maker fee 0. A yes/no settlement pays $1 per winning contract and charges no settlement fee. The session prefers the official market `result` and falls back to the BRTI compare only after three minutes.
+`KXBTC15M` is fee type `quadratic` with multiplier 1 (verified via `GET /series/KXBTC15M`): taker fee `ceil_6dp(0.07 × C × P × (1−P))`, maker fee 0. A yes/no settlement pays $1 per winning contract and charges no settlement fee. The session prefers the official market `result` and falls back to the BRTI compare only after three minutes. An open position can also be sold inside the window: the paper process hits the visible bid on the side it holds (sell YES or sell NO; it does not buy the other outcome to flatten) and pays the same taker fee. Anything still open at expiry settles as before.
 
-The `0.50` target is an aspirational KPI for the progress meter and for risk cuts when equity is behind a linear pace. It is not a forecast and not a promise.
+The `0.50` target is an aspirational KPI for the progress meter and for risk cuts when equity is behind a linear pace. It is not a forecast and not a promise. A losing close tightens edge, size, stop, and take-profit immediately. A healthy tape can loosen only after four closes, and never by raising size to chase the KPI. An open mark that is down by at least half a percent of bankroll (floor $1) tightens once per position. Separately, an online logistic model updates from each closed trade's entry features (edge, regime, time left, book imbalance, spread, depth, maker vs taker, price vs model). It does not call an external model API. Until four closed trades it only records samples; after that it can demand more edge, cut size, shift maker preference, or exit early. Weights resume from `state.json`. A new session starts cold. Hold time and the exit reason are logged, not used as inputs, because they are unknown when the order is placed.
 
 On the VPS, from the repo root, with `KALSHI_TRADE_ENV=paper`:
 
@@ -130,7 +130,9 @@ On the VPS, from the repo root, with `KALSHI_TRADE_ENV=paper`:
 paper-btc-15m --bankroll 1000 --hours 24 --target-return 0.50
 ```
 
-State lands in `data/paper-sessions/` (gitignored). A lock file stops a second paper process from double-trading. Restarting before `ends_at` resumes the same fake account. The dashboard at [http://127.0.0.1:8787](http://127.0.0.1:8787) picks the session up on its own. The strategy starts from the signal-edge bars (8¢ mid-window, 3¢ in the close minute) and may raise the bar or cut size when rolling PnL, hit rate, or the aspirational pace says so. It does not increase size to chase a deficit.
+State lands in `data/paper-sessions/` (gitignored). A lock file stops a second paper process from double-trading. Restarting before `ends_at` resumes the same fake account, including learner weights. The dashboard at [http://127.0.0.1:8787](http://127.0.0.1:8787) picks the session up on its own. The strategy starts from the signal-edge bars (8¢ mid-window, 3¢ in the close minute, 8¢ stop, 6¢ take-profit) and tightens when closes, the open mark, or the learner say so. It does not increase size to chase a deficit.
+
+To pick up this behavior on the VPS, restart only `paper-btc-15m` (leave `record-btc-15m` writing the JSONL). Resume keeps the current session. For a clean bankroll with the same flags, stop the paper process, move `data/paper-sessions/` aside, then start again with `KALSHI_TRADE_ENV=paper`.
 
 Replay the last-minute paper hint against official settlements (local report, no orders):
 

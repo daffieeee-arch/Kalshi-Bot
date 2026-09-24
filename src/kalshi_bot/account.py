@@ -12,7 +12,14 @@ from typing import Never
 
 from kalshi_bot.fees import quadratic_taker_fee
 from kalshi_bot.orderbook import OrderbookState
-from kalshi_bot.paper import PaperFill, PaperIntent, PaperLedger
+from kalshi_bot.paper import (
+    PaperFill,
+    PaperIntent,
+    PaperLedger,
+    net_open_qty,
+    open_cost,
+    open_cost_with_fees,
+)
 
 
 class PaperAccount:
@@ -28,7 +35,13 @@ class PaperAccount:
 
     def note_fills(self, fills: list[PaperFill]) -> None:
         for fill in fills:
-            self.cash -= fill.price * fill.count + fill.fee
+            if fill.action == "buy":
+                self.cash -= fill.price * fill.count + fill.fee
+            elif fill.action == "sell":
+                self.cash += fill.price * fill.count - fill.fee
+            else:
+                unreachable: Never = fill.action
+                raise ValueError(f"unknown action {unreachable!r}")
 
     def mark_credited(self) -> None:
         """Settled intents already included in ``cash`` (after a reload)."""
@@ -46,7 +59,7 @@ class PaperAccount:
             self._credited.add(key)
             if not intent.won:
                 continue
-            filled = sum((fill.count for fill in intent.fills), Decimal("0"))
+            filled = net_open_qty(intent)
             if filled <= 0:
                 continue
             payout = filled
@@ -60,8 +73,7 @@ class PaperAccount:
         for intent in self.ledger.intents:
             if intent.status != "open":
                 continue
-            for fill in intent.fills:
-                risk += fill.price * fill.count + fill.fee
+            risk += open_cost_with_fees(intent)
             if intent.remaining > 0:
                 risk += intent.remaining * _unit_reserve(intent)
         return risk
@@ -80,12 +92,12 @@ class PaperAccount:
         for intent in self.ledger.intents:
             if intent.status != "open":
                 continue
-            filled = sum((fill.count for fill in intent.fills), Decimal("0"))
+            filled = net_open_qty(intent)
             if filled <= 0:
                 continue
             bid = _mark_bid(book, intent)
             if bid is None:
-                total += sum((fill.price * fill.count for fill in intent.fills), Decimal("0"))
+                total += open_cost(intent)
             else:
                 total += bid * filled
         return total
@@ -95,7 +107,11 @@ class PaperAccount:
 
     def realized_pnl(self) -> Decimal:
         return sum(
-            (intent.pnl or Decimal("0") for intent in self.ledger.intents if intent.status == "settled"),
+            (
+                intent.pnl or Decimal("0")
+                for intent in self.ledger.intents
+                if intent.status == "settled" or intent.status == "closed"
+            ),
             Decimal("0"),
         )
 
@@ -106,7 +122,7 @@ class PaperAccount:
         wins = 0
         losses = 0
         for intent in self.ledger.intents:
-            if intent.status != "settled" or not intent.fills or intent.pnl is None:
+            if intent.status not in ("settled", "closed") or not intent.fills or intent.pnl is None:
                 continue
             if intent.pnl > 0:
                 wins += 1

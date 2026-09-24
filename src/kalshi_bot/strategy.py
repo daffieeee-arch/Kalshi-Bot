@@ -3,10 +3,14 @@
 Defaults match ``signal._hint`` (8¢ mid-window, 3¢ last minute). Last-minute
 takes also wait for 15 close ticks, the same gate ``replay`` uses so the first
 close print cannot lock a contract.
+
+Open positions can close inside the window. A loss or a bad open mark tightens
+before four settlements have stacked up. Size is not raised to chase a deficit.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Literal, Never
@@ -31,6 +35,14 @@ _BEHIND_BANKROLL = Decimal("0.02")
 _HIT_WEAK = Decimal("0.45")
 _HIT_HEALTHY = Decimal("0.55")
 _ADAPT_WINDOW = 8
+_DEFAULT_STOP = Decimal("0.08")
+_DEFAULT_TAKE = Decimal("0.06")
+_DEFAULT_FLIP = Decimal("0.05")
+_MIN_STOP = Decimal("0.04")
+_MIN_TAKE = Decimal("0.03")
+_EXIT_SLIPPAGE = Decimal("0.02")
+_MIN_SELL = Decimal("0.01")
+_FEATURE_WINDOW_S = 900.0
 _BLOCK_NOTES = frozenset(
     {
         "market closed",
@@ -55,6 +67,9 @@ class StrategyParams:
     max_open_risk: Decimal = Decimal("50")
     risk_ceiling: Decimal = Decimal("50")
     name: str = STRATEGY_NAME
+    stop_loss: Decimal = _DEFAULT_STOP
+    take_profit: Decimal = _DEFAULT_TAKE
+    flip_margin: Decimal = _DEFAULT_FLIP
 
     def to_dict(self) -> dict[str, str | float]:
         return {
@@ -66,6 +81,9 @@ class StrategyParams:
             "cooldown_s": self.cooldown_s,
             "max_open_risk": format(self.max_open_risk, "f"),
             "risk_ceiling": format(self.risk_ceiling, "f"),
+            "stop_loss": format(self.stop_loss, "f"),
+            "take_profit": format(self.take_profit, "f"),
+            "flip_margin": format(self.flip_margin, "f"),
         }
 
     @classmethod
@@ -79,6 +97,9 @@ class StrategyParams:
             max_open_risk=Decimal(str(raw["max_open_risk"])),
             risk_ceiling=Decimal(str(raw["risk_ceiling"])),
             name=str(raw.get("name") or STRATEGY_NAME),
+            stop_loss=Decimal(str(raw.get("stop_loss", _DEFAULT_STOP))),
+            take_profit=Decimal(str(raw.get("take_profit", _DEFAULT_TAKE))),
+            flip_margin=Decimal(str(raw.get("flip_margin", _DEFAULT_FLIP))),
         )
 
 
@@ -104,6 +125,17 @@ class EntryPlan:
     limit: Decimal
     count: Decimal
     edge: Decimal
+
+
+@dataclass(frozen=True)
+class ExitPlan:
+    """Sell the held side into visible bids. Not a buy of the other outcome."""
+
+    outcome: Side
+    count: Decimal
+    reason: str
+    min_price: Decimal = _MIN_SELL
+    slippage: Decimal = _EXIT_SLIPPAGE
 
 
 @dataclass(frozen=True)
@@ -168,6 +200,125 @@ def decide(
     )
 
 
+def decide_exit(
+    signal: Signal,
+    params: StrategyParams,
+    book: OrderbookState,
+    *,
+    outcome: Side,
+    filled: Decimal,
+    avg_price: Decimal,
+    learn_exit: bool,
+    held_ms: int | None = None,
+) -> ExitPlan | None:
+    """Close a live position, or keep it for settlement.
+
+    Order is signal flip, adverse mid, a learned loss pattern, edge gone
+    (bid through the model after the taker fee), then a realizable take-profit.
+    A stop waits two seconds so the entry spread itself is not the stop.
+    A stale or closed book does not exit.
+    """
+    if filled <= 0 or signal.model_yes is None or signal.note in _BLOCK_NOTES:
+        return None
+    if signal.seconds_left is not None and signal.seconds_left < 2:
+        return None
+    if not book.valid:
+        return None
+    model = _model(signal, outcome)
+    bid = book.best_bid(outcome)
+    if model is None or bid is None:
+        return None
+    ask = book.implied_ask(outcome)
+    mid = (bid + ask) / 2 if ask is not None else bid
+    fee = quadratic_taker_fee(Decimal("1"), bid)
+    flip_at = Decimal("0.5") - params.flip_margin
+    stop_ready = held_ms is None or held_ms >= 2000
+    if model < flip_at:
+        reason = "signal_flip"
+    elif stop_ready and mid <= avg_price - params.stop_loss:
+        reason = "stop"
+    elif learn_exit:
+        reason = "learned"
+    elif bid - fee >= model:
+        reason = "edge_gone"
+    elif bid >= avg_price + params.take_profit:
+        reason = "take_profit"
+    else:
+        return None
+    return ExitPlan(outcome=outcome, count=filled, reason=reason)
+
+
+def cancel_reason(
+    signal: Signal,
+    params: StrategyParams,
+    *,
+    outcome: Side,
+    style: PaperStyle,
+    price: Decimal,
+) -> str | None:
+    """Drop a resting buy whose side or edge is no longer the thesis."""
+    if signal.model_yes is None or signal.note in _BLOCK_NOTES:
+        return None
+    model = _model(signal, outcome)
+    if model is None:
+        return None
+    if model < Decimal("0.5") - params.flip_margin:
+        return "cancel_signal_flip"
+    bar = _edge_bar(signal.regime, params)
+    if style == "maker":
+        if model - price < bar:
+            return "cancel_edge_gone"
+    elif style == "taker":
+        edge = signal.yes_edge if outcome == "yes" else signal.no_edge
+        if edge is None or edge < bar:
+            return "cancel_edge_gone"
+    else:
+        unreachable: Never = style
+        raise ValueError(f"unknown style {unreachable!r}")
+    return None
+
+
+def market_features(
+    signal: Signal,
+    book: OrderbookState,
+    outcome: Side,
+    style: PaperStyle,
+    price: Decimal,
+) -> list[float]:
+    """Entry-time features. Hold time and the exit reason are labels, not inputs."""
+    model = _model(signal, outcome)
+    if outcome == "yes":
+        edge = signal.yes_edge
+    elif outcome == "no":
+        edge = signal.no_edge
+    else:
+        unreachable: Never = outcome
+        raise ValueError(f"unknown outcome {unreachable!r}")
+    seconds = 0.0 if signal.seconds_left is None else signal.seconds_left / _FEATURE_WINDOW_S
+    bid_sz, ask_sz, spread = _touch(book, outcome)
+    depth_total = bid_sz + ask_sz
+    imbalance = 0.0 if depth_total <= 0 else float((bid_sz - ask_sz) / depth_total)
+    depth = math.log1p(float(depth_total)) / math.log1p(50.0)
+    if style == "maker":
+        maker = 1.0
+    elif style == "taker":
+        maker = 0.0
+    else:
+        unreachable_style: Never = style
+        raise ValueError(f"unknown style {unreachable_style!r}")
+    versus = 0.0 if model is None else float(price - model)
+    return [
+        0.0 if edge is None else float(edge),
+        1.0 if signal.regime == "last_minute" else 0.0,
+        min(1.0, max(0.0, seconds)),
+        min(1.0, max(-1.0, imbalance)),
+        min(1.0, max(0.0, spread)),
+        min(1.0, max(0.0, depth)),
+        maker,
+        min(0.5, max(-0.5, versus)),
+    ]
+
+
 def adapt(
     params: StrategyParams,
     *,
@@ -178,8 +329,16 @@ def adapt(
     elapsed_s: float,
     duration_s: float,
     min_samples: int = 4,
+    allow_loosen: bool = True,
 ) -> Adaptation | None:
-    """Tighten when the aspirational pace or the tape says so. Never chase a deficit."""
+    """Tighten on a losing close immediately. Loosen only after a full window.
+
+    The +50% pace still cannot raise size. An empty score does nothing.
+    """
+    if score.n >= 1:
+        hit = Decimal(score.wins) / Decimal(score.n)
+        if score.pnl < 0 or hit < _HIT_WEAK:
+            return _tighten(params, behind=False, hit=hit, pnl=score.pnl, mark=False)
     if score.n < min_samples:
         return None
     behind = _behind_pace(
@@ -192,10 +351,28 @@ def adapt(
     hit = Decimal(score.wins) / Decimal(score.n)
     rolling_bad = score.pnl < 0 or hit < _HIT_WEAK
     if behind or rolling_bad:
-        return _tighten(params, behind=behind, hit=hit, pnl=score.pnl)
-    if hit >= _HIT_HEALTHY and score.pnl > 0:
+        return _tighten(params, behind=behind, hit=hit, pnl=score.pnl, mark=False)
+    if allow_loosen and hit >= _HIT_HEALTHY and score.pnl > 0:
         return _loosen(params)
     return None
+
+
+def adapt_to_mark(
+    params: StrategyParams,
+    *,
+    unrealized: Decimal,
+    drawdown: Decimal,
+) -> Adaptation | None:
+    """One defensive step when the open mark is through ``drawdown`` dollars."""
+    if drawdown <= 0 or unrealized > -drawdown:
+        return None
+    return _tighten(
+        params,
+        behind=False,
+        hit=Decimal("1"),
+        pnl=Decimal("0"),
+        mark=True,
+    )
 
 
 def _edge_bar(regime: Literal["mid", "last_minute"], params: StrategyParams) -> Decimal:
@@ -357,6 +534,7 @@ def _tighten(
     behind: bool,
     hit: Decimal,
     pnl: Decimal,
+    mark: bool,
 ) -> Adaptation | None:
     reasons: list[str] = []
     if behind:
@@ -365,6 +543,8 @@ def _tighten(
         reasons.append("rolling pnl negative")
     if hit < _HIT_WEAK:
         reasons.append(f"hit rate {hit.quantize(Decimal('0.01'))}")
+    if mark:
+        reasons.append("open mark drawdown")
     after = StrategyParams(
         mid_edge=min(_MAX_MID_EDGE, params.mid_edge + Decimal("0.01")),
         last_minute_edge=min(_MAX_LAST_EDGE, params.last_minute_edge + Decimal("0.005")),
@@ -377,6 +557,9 @@ def _tighten(
         ),
         risk_ceiling=params.risk_ceiling,
         name=params.name,
+        stop_loss=max(_MIN_STOP, params.stop_loss - Decimal("0.01")),
+        take_profit=max(_MIN_TAKE, params.take_profit - Decimal("0.01")),
+        flip_margin=params.flip_margin,
     )
     if after == params:
         return None
@@ -400,6 +583,9 @@ def _loosen(params: StrategyParams) -> Adaptation | None:
         max_open_risk=restored,
         risk_ceiling=params.risk_ceiling,
         name=params.name,
+        stop_loss=min(_DEFAULT_STOP, params.stop_loss + Decimal("0.01")),
+        take_profit=min(_DEFAULT_TAKE, params.take_profit + Decimal("0.01")),
+        flip_margin=params.flip_margin,
     )
     if after == params:
         return None
@@ -408,6 +594,23 @@ def _loosen(params: StrategyParams) -> Adaptation | None:
         before=params,
         after=after,
     )
+
+
+def _touch(
+    book: OrderbookState,
+    outcome: Side,
+) -> tuple[Decimal, Decimal, float]:
+    if not book.valid:
+        return Decimal("0"), Decimal("0"), 0.0
+    bid = book.best_bid(outcome)
+    ask = book.implied_ask(outcome)
+    bid_sz = book.size_at(outcome, bid) if bid is not None else Decimal("0")
+    ask_sz = Decimal("0")
+    if ask is not None:
+        opposite: Side = "no" if outcome == "yes" else "yes"
+        ask_sz = book.size_at(opposite, Decimal("1") - ask)
+    spread = float(ask - bid) if ask is not None and bid is not None else 0.0
+    return bid_sz, ask_sz, spread
 
 
 def _floor_risk(params: StrategyParams) -> Decimal:
