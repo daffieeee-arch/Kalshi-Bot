@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from kalshi_bot.account import PaperAccount
+from kalshi_bot.fees import quadratic_taker_fee
 from kalshi_bot.orderbook import OrderbookState
-from kalshi_bot.paper import PaperIntent, PaperLedger
+from kalshi_bot.paper import PaperIntent, PaperLedger, net_open_qty
 from test_orderbook import _delta, _snapshot
 
 
@@ -173,6 +175,89 @@ def test_taker_walks_visible_asks_without_overfill() -> None:
     ledger.add(second)
     assert ledger.on_book(book, ts_ms=2) == []
     assert second.remaining == Decimal("10")
+
+
+def test_taker_sell_hits_visible_bids_and_keeps_settlement_for_the_rest() -> None:
+    book = OrderbookState()
+    book.apply_snapshot(
+        _snapshot(
+            yes_dollars_fp=[["0.5000", "1.00"], ["0.4000", "8.00"]],
+            no_dollars_fp=[["0.6000", "4.00"]],
+        )
+    )
+    account = PaperAccount(Decimal("1000"))
+    intent = PaperIntent(
+        market_ticker="KXBTC15M-TEST",
+        outcome="yes",
+        price=Decimal("0.40"),
+        count=Decimal("2"),
+        style="taker",
+    )
+    account.ledger.add(intent)
+    buys = account.ledger.on_book(book, ts_ms=1)
+    account.note_fills(buys)
+    assert sum((fill.count for fill in buys), Decimal("0")) == Decimal("2")
+    sells = account.ledger.sell_open(
+        intent,
+        book,
+        ts_ms=2,
+        min_price=Decimal("0.01"),
+        reason="take_profit",
+    )
+    assert len(sells) == 1
+    assert sells[0].action == "sell"
+    assert sells[0].price == Decimal("0.50")
+    assert sells[0].count == Decimal("1")
+    assert sells[0].fee == quadratic_taker_fee(Decimal("1"), Decimal("0.50"))
+    assert sells[0].fee > 0
+    assert intent.status == "open"
+    assert net_open_qty(intent) == Decimal("1")
+    before_sell = account.cash
+    account.note_fills(sells)
+    assert account.cash == before_sell + sells[0].price * sells[0].count - sells[0].fee
+    cash_after_sell = account.cash
+    account.ledger.on_settlement(market_ticker="KXBTC15M-TEST", official_result="yes")
+    paid = account.credit_settlements()
+    assert paid == Decimal("1")
+    assert intent.exit_reason == "settlement"
+    assert account.cash == cash_after_sell + paid
+    bought_cost = sum((fill.price * fill.count for fill in buys), Decimal("0"))
+    bought_fee = sum((fill.fee for fill in buys), Decimal("0"))
+    assert intent.pnl == paid + sells[0].price * sells[0].count - sells[0].fee - bought_cost - bought_fee
+
+
+def test_full_sell_realizes_pnl_without_a_settlement_payout() -> None:
+    book = OrderbookState()
+    book.apply_snapshot(
+        _snapshot(
+            yes_dollars_fp=[["0.4500", "5.00"]],
+            no_dollars_fp=[["0.6000", "5.00"]],
+        )
+    )
+    account = PaperAccount(Decimal("1000"))
+    intent = PaperIntent(
+        market_ticker="KXBTC15M-TEST",
+        outcome="yes",
+        price=Decimal("0.40"),
+        count=Decimal("1"),
+        style="taker",
+    )
+    account.ledger.add(intent)
+    account.note_fills(account.ledger.on_book(book, ts_ms=1))
+    sells = account.ledger.sell_open(
+        intent,
+        book,
+        ts_ms=2,
+        min_price=Decimal("0.01"),
+        reason="stop",
+    )
+    account.note_fills(sells)
+    assert intent.status == "closed"
+    assert intent.exit_reason == "stop"
+    assert intent.pnl is not None
+    assert account.credit_settlements() == Decimal("0")
+    assert account.equity(OrderbookState()) == Decimal("1000") + intent.pnl
+    assert account.realized_pnl() == intent.pnl
 
 
 def test_book_delta_does_not_fill_maker() -> None:

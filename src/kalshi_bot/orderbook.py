@@ -52,6 +52,11 @@ class OrderbookState:
     def size_at(self, side: Side, price: Decimal) -> Decimal:
         return self._book(side).get(price, Decimal("0"))
 
+    def bid_levels(self, side: Side) -> list[tuple[Decimal, Decimal]]:
+        """Visible bids from best to worst as ``(price, size)``."""
+        book = self._book(side)
+        return [(price, book[price]) for price in sorted(book, reverse=True)]
+
     def ask_levels(self, side: Side) -> list[tuple[Decimal, Decimal]]:
         """Visible asks from best to worst as ``(price, size)``.
 

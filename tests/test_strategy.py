@@ -8,7 +8,7 @@ from decimal import Decimal
 from kalshi_bot.fees import quadratic_taker_fee
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.signal import Signal
-from kalshi_bot.strategy import RollingScore, StrategyParams, adapt, decide
+from kalshi_bot.strategy import RollingScore, StrategyParams, adapt, adapt_to_mark, decide, decide_exit
 from test_orderbook import _snapshot
 
 
@@ -79,11 +79,11 @@ def test_decide_waits_when_the_book_is_blocked() -> None:
     assert plan is None
 
 
-def test_adapt_needs_a_sample() -> None:
+def test_adapt_ignores_an_empty_score() -> None:
     assert (
         adapt(
             StrategyParams(),
-            score=RollingScore(n=3, wins=0, pnl=Decimal("-1")),
+            score=RollingScore(n=0, wins=0, pnl=Decimal("0")),
             equity=Decimal("900"),
             bankroll=Decimal("1000"),
             target_return=Decimal("0.50"),
@@ -92,6 +92,24 @@ def test_adapt_needs_a_sample() -> None:
         )
         is None
     )
+
+
+def test_adapt_tightens_on_the_first_losing_close() -> None:
+    params = StrategyParams()
+    change = adapt(
+        params,
+        score=RollingScore(n=1, wins=0, pnl=Decimal("-0.40")),
+        equity=Decimal("999.60"),
+        bankroll=Decimal("1000"),
+        target_return=Decimal("0.50"),
+        elapsed_s=30 * 60,
+        duration_s=24 * 3600,
+    )
+    assert change is not None
+    assert change.after.contracts < params.contracts
+    assert change.after.mid_edge > params.mid_edge
+    assert change.after.stop_loss < params.stop_loss
+    assert "rolling pnl negative" in change.reason
 
 
 def test_adapt_tightens_when_behind_even_if_recent_trades_won() -> None:
@@ -112,6 +130,138 @@ def test_adapt_tightens_when_behind_even_if_recent_trades_won() -> None:
     assert change.after.maker_bias > params.maker_bias
     assert "behind aspirational pace" in change.reason
     assert "cutting size" in change.reason
+
+
+def test_decide_exit_signal_flip_stop_and_take_profit() -> None:
+    hold = _signal(model_yes=Decimal("0.72"), yes_edge=Decimal("0.20"), no_edge=Decimal("-0.2"))
+    assert (
+        decide_exit(
+            hold,
+            StrategyParams(),
+            _exit_book(bid="0.4200"),
+            outcome="yes",
+            filled=Decimal("2"),
+            avg_price=Decimal("0.40"),
+            learn_exit=False,
+        )
+        is None
+    )
+    flipped = decide_exit(
+        _signal(model_yes=Decimal("0.20")),
+        StrategyParams(),
+        _book(),
+        outcome="yes",
+        filled=Decimal("2"),
+        avg_price=Decimal("0.40"),
+        learn_exit=False,
+    )
+    assert flipped is not None
+    assert flipped.reason == "signal_flip"
+    stopped = decide_exit(
+        hold,
+        StrategyParams(),
+        _book(),
+        outcome="yes",
+        filled=Decimal("2"),
+        avg_price=Decimal("0.70"),
+        learn_exit=False,
+        held_ms=5_000,
+    )
+    assert stopped is not None
+    assert stopped.reason == "stop"
+    assert (
+        decide_exit(
+            hold,
+            StrategyParams(),
+            _book(),
+            outcome="yes",
+            filled=Decimal("2"),
+            avg_price=Decimal("0.70"),
+            learn_exit=False,
+            held_ms=500,
+        )
+        is None
+    )
+    banked = decide_exit(
+        hold,
+        StrategyParams(),
+        _exit_book(bid="0.5200"),
+        outcome="yes",
+        filled=Decimal("2"),
+        avg_price=Decimal("0.40"),
+        learn_exit=False,
+    )
+    assert banked is not None
+    assert banked.reason == "take_profit"
+    assert (
+        decide_exit(
+            _signal(seconds_left=1.0),
+            StrategyParams(),
+            _exit_book(bid="0.1000"),
+            outcome="yes",
+            filled=Decimal("2"),
+            avg_price=Decimal("0.70"),
+            learn_exit=False,
+            held_ms=10_000,
+        )
+        is None
+    )
+
+
+def test_decide_exit_learned_and_edge_gone() -> None:
+    # Bid 0.55 is through a 0.48 model after the taker fee, and not a flip or a stop.
+    gone = decide_exit(
+        _signal(model_yes=Decimal("0.48"), yes_edge=Decimal("0"), no_edge=Decimal("-0.2")),
+        StrategyParams(),
+        _exit_book(bid="0.5500"),
+        outcome="yes",
+        filled=Decimal("1"),
+        avg_price=Decimal("0.50"),
+        learn_exit=False,
+    )
+    assert gone is not None
+    assert gone.reason == "edge_gone"
+    learned = decide_exit(
+        _signal(model_yes=Decimal("0.72"), yes_edge=Decimal("0.20"), no_edge=Decimal("-0.2")),
+        StrategyParams(),
+        _book(),
+        outcome="yes",
+        filled=Decimal("1"),
+        avg_price=Decimal("0.40"),
+        learn_exit=True,
+    )
+    assert learned is not None
+    assert learned.reason == "learned"
+
+
+def test_adapt_to_mark_tightens_once_per_call() -> None:
+    params = StrategyParams()
+    change = adapt_to_mark(params, unrealized=Decimal("-6"), drawdown=Decimal("5"))
+    assert change is not None
+    assert "open mark drawdown" in change.reason
+    assert change.after.contracts < params.contracts
+    assert adapt_to_mark(params, unrealized=Decimal("-1"), drawdown=Decimal("5")) is None
+
+
+def test_old_params_payload_defaults_exit_thresholds() -> None:
+    raw = StrategyParams().to_dict()
+    del raw["stop_loss"]
+    del raw["take_profit"]
+    del raw["flip_margin"]
+    loaded = StrategyParams.from_dict(raw)
+    assert loaded.stop_loss == Decimal("0.08")
+    assert loaded.take_profit == Decimal("0.06")
+
+
+def _exit_book(bid: str) -> OrderbookState:
+    book = OrderbookState()
+    book.apply_snapshot(
+        _snapshot(
+            yes_dollars_fp=[[bid, "10.00"]],
+            no_dollars_fp=[["0.4000", "10.00"]],
+        )
+    )
+    return book
 
 
 def test_adapt_can_loosen_when_ahead_and_the_tape_is_healthy() -> None:

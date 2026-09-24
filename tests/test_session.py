@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -25,6 +26,7 @@ from test_orderbook import _snapshot
 
 _TICKER = "KXBTC15M-26SEP221015-15"
 _STARTED = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+_IN_WINDOW = datetime(2026, 9, 22, 14, 5, tzinfo=timezone.utc)
 _AFTER_CLOSE = datetime(2026, 9, 22, 14, 20, tzinfo=timezone.utc)
 
 
@@ -212,6 +214,152 @@ def test_session_adapts_after_four_losing_settlements(tmp_path) -> None:
     assert session.adaptations[-1][1].reason.startswith("tighten:")
 
 
+def _arm_quotes(session: PaperSession, *, spot: str, strike: str, yes_bid: str, no_bid: str) -> None:
+    session.armed = True
+    session.ticker = _TICKER
+    session.spot = Decimal(spot)
+    session.strike = Decimal(strike)
+    session.book.apply_snapshot(
+        _snapshot(
+            market_ticker=_TICKER,
+            yes_dollars_fp=[[yes_bid, "10.00"]],
+            no_dollars_fp=[[no_bid, "10.00"]],
+        )
+    )
+    session._book_mono = time.monotonic()
+    session._brti_mono = time.monotonic()
+
+
+def _held_yes(session: PaperSession, *, price: str, count: str = "2") -> PaperIntent:
+    intent = PaperIntent(
+        market_ticker=_TICKER,
+        outcome="yes",
+        price=Decimal(price),
+        count=Decimal(count),
+        style="maker",
+    )
+    intent.remaining = Decimal("0")
+    intent.opened_ms = 1
+    intent.entry_features = [0.1, 0.0, 0.5, 0.0, 0.05, 0.2, 1.0, -0.05]
+    intent.fills = [
+        PaperFill(
+            market_ticker=_TICKER,
+            style="maker",
+            outcome="yes",
+            price=Decimal(price),
+            count=Decimal(count),
+            fee=Decimal("0"),
+            ts_ms=1,
+            source="trade",
+            action="buy",
+        )
+    ]
+    session.account.ledger.add(intent)
+    session.account.cash -= Decimal(price) * Decimal(count)
+    return intent
+
+
+def test_session_sells_inside_the_window_on_signal_flip(tmp_path) -> None:
+    session = _session(tmp_path)
+    intent = _held_yes(session, price="0.40")
+    _arm_quotes(session, spot="100", strike="200000", yes_bid="0.4200", no_bid="0.5000")
+    session._on_quote(10_000, _IN_WINDOW)
+    assert intent.status == "closed"
+    assert intent.exit_reason == "signal_flip"
+    assert intent.pnl is not None
+    assert session.learner.n == 1
+    assert "signal_flip" in session.learner.last_reason
+    view = session.view(_IN_WINDOW)
+    assert view["open_trades"] == []
+    assert view["closed_trades"][0]["exit_reason"] == "signal_flip"
+    assert view["learner"]["samples"] == 1
+    session.save()
+    loaded = PaperSession.load(session.root)
+    assert loaded is not None
+    assert loaded.learner.n == 1
+    assert loaded.account.realized_pnl() == intent.pnl
+
+
+def test_session_stop_adapts_before_four_settlements(tmp_path) -> None:
+    session = _session(tmp_path)
+    before = session.params.contracts
+    intent = _held_yes(session, price="0.55")
+    _arm_quotes(session, spot="200000", strike="100", yes_bid="0.3000", no_bid="0.5500")
+    session._on_quote(10_000, _IN_WINDOW)
+    assert intent.exit_reason == "stop"
+    assert intent.pnl is not None and intent.pnl < 0
+    assert session.params.contracts < before
+    assert session.adaptations
+    assert session.adaptations[-1][1].reason.startswith("tighten:")
+    assert "rolling pnl negative" in session.adaptations[-1][1].reason
+
+
+def test_session_holds_a_live_thesis_until_settlement(tmp_path) -> None:
+    session = _session(tmp_path)
+    intent = _held_yes(session, price="0.50")
+    _arm_quotes(session, spot="200000", strike="100", yes_bid="0.5200", no_bid="0.4500")
+    session._on_quote(10_000, _IN_WINDOW)
+    assert intent.status == "open"
+    assert intent.exit_reason is None
+    mark = session.view(_IN_WINDOW)["open_trades"][0]["mark"]
+    assert mark == "0.5200"
+    session.settle_ticker(
+        _TICKER,
+        official="yes",
+        close_avg=Decimal("200000"),
+        strike=Decimal("100"),
+        now=_IN_WINDOW,
+    )
+    assert intent.status == "settled"
+    assert intent.won is True
+    assert intent.exit_reason == "settlement"
+    assert session.account.credit_settlements() == Decimal("0")
+    assert session.account.realized_pnl() == intent.pnl
+    assert intent.pnl is not None and intent.pnl > 0
+
+
+def test_session_cancels_a_wrong_sided_resting_maker(tmp_path) -> None:
+    session = _session(tmp_path)
+    intent = PaperIntent(
+        market_ticker=_TICKER,
+        outcome="yes",
+        price=Decimal("0.40"),
+        count=Decimal("5"),
+        style="maker",
+    )
+    session.account.ledger.add(intent)
+    session.last_entry_ms = 5_000
+    _arm_quotes(session, spot="100", strike="200000", yes_bid="0.4200", no_bid="0.5000")
+    session._on_quote(5_000, _IN_WINDOW)
+    assert intent.status == "cancelled"
+    assert intent.exit_reason == "cancel_signal_flip"
+    assert intent.remaining == Decimal("0")
+    assert session.account.cash == Decimal("1000")
+    assert session.learner.n == 0
+
+
+def test_open_mark_drawdown_tightens_once_per_position(tmp_path) -> None:
+    session = _session(tmp_path)
+    session.armed = True
+    intent = _held_yes(session, price="0.60", count="20")
+    session.book.apply_snapshot(
+        _snapshot(
+            market_ticker=_TICKER,
+            yes_dollars_fp=[["0.1000", "30.00"]],
+            no_dollars_fp=[["0.2000", "10.00"]],
+        )
+    )
+    before = session.params.contracts
+    session._maybe_mark_adapt(_IN_WINDOW)
+    assert session.params.contracts < before
+    assert "open mark drawdown" in session.adaptations[-1][1].reason
+    stopped = session.params.contracts
+    session._last_mark_adapt_mono = None
+    session._maybe_mark_adapt(_IN_WINDOW)
+    assert session.params.contracts == stopped
+    assert intent.status == "open"
+
+
 def test_second_session_lock_is_refused(tmp_path) -> None:
     path = tmp_path / "session.lock"
     first = SessionLock(path)
@@ -267,8 +415,11 @@ def test_dashboard_reads_session_and_renders_panels(tmp_path) -> None:
         assert page.status_code == 200
         assert 'id="paper-equity"' in page.text
         assert 'id="paper-fills"' in page.text
+        assert 'id="paper-learn"' in page.text
         body = client.get("/api/state").json()
         assert body["paper_session"]["equity"] == "1000"
+        assert body["paper_session"]["learner"]["samples"] == 0
+        assert body["paper_session"]["learner"]["active"] is False
         assert body["paper_session"]["ends_at_amsterdam"].endswith("CEST")
         script = client.get("/static/dashboard.js")
         assert "Europe/Amsterdam" in script.text

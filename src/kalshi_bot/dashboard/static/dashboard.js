@@ -235,6 +235,7 @@ function renderPaper(session) {
     $("paper-record").textContent = "no settled trades";
     $("paper-strategy").textContent = "—";
     $("paper-params").textContent = "";
+    $("paper-learn").textContent = "learning —";
     fillRows("paper-adapt", [], "No adaptation yet.");
     fillRows("paper-open", [], "No open paper trades.");
     fillRows("paper-closed", [], "No closed paper trades.");
@@ -260,12 +261,26 @@ function renderPaper(session) {
   $("paper-strategy").textContent = session.strategy || "—";
   const params = session.params || {};
   $("paper-params").textContent = params.mid_edge
-    ? `mid ${params.mid_edge} · last ${params.last_minute_edge} · size ${params.contracts} · maker bias ${params.maker_bias} · cooldown ${params.cooldown_s}s · risk ${params.max_open_risk}`
+    ? `mid ${params.mid_edge} · last ${params.last_minute_edge} · size ${params.contracts} · maker bias ${params.maker_bias} · cooldown ${params.cooldown_s}s · risk ${params.max_open_risk} · stop ${params.stop_loss || "—"} · tp ${params.take_profit || "—"}`
     : "";
+  renderLearner(session.learner);
   renderAdaptations(session.adaptations || []);
   renderTrades("paper-open", session.open_trades || [], "No open paper trades.");
   renderTrades("paper-closed", session.closed_trades || [], "No closed paper trades.");
   renderFills(session.fills || []);
+}
+
+function renderLearner(learn) {
+  if (!learn) {
+    $("paper-learn").textContent = "learning cold start";
+    return;
+  }
+  const n = learn.samples || 0;
+  const stateLabel = learn.active ? "learning live" : `warming up · rules until ${learn.min_samples || 4}`;
+  const weights = learn.weights || {};
+  const edge = weights.edge == null ? "—" : Number(weights.edge).toFixed(3);
+  const maker = weights.maker == null ? "—" : Number(weights.maker).toFixed(3);
+  $("paper-learn").textContent = `${stateLabel} · ${n} samples · ${learn.last_reason || "cold start"} · w edge ${edge} · maker ${maker}`;
 }
 
 function renderAdaptations(rows) {
@@ -298,9 +313,12 @@ function renderTrades(id, rows, empty) {
     const el = document.createElement("div");
     el.className = "trade-row";
     const pnl = row.pnl == null ? "" : fmtMoney(row.pnl);
+    const mark = row.mark ? ` · mark ${fmtPx(row.mark)}` : "";
+    const upnl = row.unrealized == null || row.unrealized === "" ? "" : ` · u ${fmtMoney(row.unrealized)}`;
+    const reason = row.exit_reason ? ` · ${row.exit_reason}` : "";
     el.innerHTML = `
       <span class="${row.outcome === "no" ? "no" : "yes"}">${(row.outcome || "").toUpperCase()} ${row.style || ""}</span>
-      <span>${row.ticker || ""} · ${row.filled || "0"} @ ${fmtPx(row.avg_price || row.limit)} · fee ${row.fee || "0"}</span>
+      <span>${row.ticker || ""} · ${row.filled || "0"} @ ${fmtPx(row.avg_price || row.limit)}${mark}${upnl} · fee ${row.fee || "0"}${reason}</span>
       <span class="muted">${pnl} ${row.at_amsterdam || ""}</span>
     `;
     root.append(el);
@@ -318,7 +336,7 @@ function renderFills(rows) {
     const el = document.createElement("div");
     el.className = "trade-row";
     el.innerHTML = `
-      <span class="${row.outcome === "no" ? "no" : "yes"}">${(row.outcome || "").toUpperCase()} ${row.style || ""}</span>
+      <span class="${row.outcome === "no" ? "no" : "yes"}">${(row.outcome || "").toUpperCase()} ${row.action === "sell" ? "sell" : "buy"}</span>
       <span>${row.count || ""} @ ${fmtPx(row.price)} · fee ${row.fee || "0"} · ${row.source || ""}</span>
       <span class="muted">${row.at_amsterdam || ""}</span>
     `;
