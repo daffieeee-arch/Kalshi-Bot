@@ -274,8 +274,48 @@ legend {
 }
 
 .paused .hero,
-.paused .grid {
+.paused .grid,
+.paused .blotter {
   opacity: 0.72;
+}
+
+.span-2 {
+  grid-column: span 2;
+}
+
+.blotter {
+  width: min(1200px, calc(100% - 32px));
+  margin: 12px auto 0;
+}
+
+.progress {
+  height: 8px;
+  border-radius: 99px;
+  background: #21262d;
+  overflow: hidden;
+  margin: 8px 0;
+}
+
+.progress > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--yes);
+}
+
+.trade-row,
+.adapt-row {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.trade-row {
+  grid-template-columns: 72px 1fr auto;
+}
+
+.adapt-row {
+  grid-template-columns: 168px 1fr;
 }
 
 @media (max-width: 900px) {
@@ -283,6 +323,10 @@ legend {
   .toolbar,
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .span-2 {
+    grid-column: auto;
   }
 
   .top {

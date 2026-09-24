@@ -80,18 +80,17 @@ class PaperLedger:
                 continue
             if intent.market_ticker != book.market_ticker:
                 continue
-            ask = book.implied_ask(intent.outcome)
-            if ask is None or ask > intent.price:
-                continue
             opposite: Side = "no" if intent.outcome == "yes" else "yes"
-            price_level = Decimal("1") - ask
-            available = book.size_at(opposite, price_level)
-            room = self._room(intent.market_ticker, opposite, price_level, available)
-            qty = min(intent.remaining, room)
-            if qty <= 0:
-                continue
-            self._consume(intent.market_ticker, opposite, price_level, qty)
-            fills.extend(self._fill(intent, price=ask, count=qty, ts_ms=ts_ms, source="book"))
+            for ask, available in book.ask_levels(intent.outcome):
+                if intent.remaining <= 0 or ask > intent.price:
+                    break
+                price_level = Decimal("1") - ask
+                room = self._room(intent.market_ticker, opposite, price_level, available)
+                qty = min(intent.remaining, room)
+                if qty <= 0:
+                    continue
+                self._consume(intent.market_ticker, opposite, price_level, qty)
+                fills.extend(self._fill(intent, price=ask, count=qty, ts_ms=ts_ms, source="book"))
         return fills
 
     def on_trade(self, message: dict[str, Any]) -> list[PaperFill]:
@@ -177,6 +176,13 @@ class PaperLedger:
             reconstructed_yes=reconstructed,
             mismatch=mismatch,
         )
+
+    def export_taken(self) -> list[tuple[str, Side, Decimal, Decimal]]:
+        """Displayed size already used, so a reload cannot take it again."""
+        return [(ticker, side, price, qty) for (ticker, side, price), qty in self._taken.items()]
+
+    def import_taken(self, rows: list[tuple[str, Side, Decimal, Decimal]]) -> None:
+        self._taken = {(ticker, side, price): qty for ticker, side, price, qty in rows}
 
     def _room(self, ticker: str, side: Side, price: Decimal, available: Decimal) -> Decimal:
         key = (ticker, side, price)

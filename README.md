@@ -42,9 +42,12 @@ src/kalshi_bot/
   paper.py       # local paper ledger
   fees.py        # quadratic taker fee
   discover.py    # KXBTC15M open-market discovery
-  cli.py         # discover-btc-15m + record-btc-15m + dashboard-btc-15m + replay-btc-15m
-  dashboard/     # local live overview of the JSONL capture
+  cli.py         # discover, record, dashboard, replay, paper-btc-15m
+  dashboard/     # local live overview of the JSONL capture and paper session
   replay.py      # last-minute paper hint vs settlement on a JSONL capture
+  strategy.py    # signal-edge params and adaptation
+  account.py     # fake cash, equity, settlement credit
+  session.py     # paper-btc-15m tail of the recorder JSONL
 ```
 
 ## Setup
@@ -111,7 +114,23 @@ On any machine in the Tailscale tailnet (Mac, phone, …):
 [https://chupa.tail9f5972.ts.net:8443](https://chupa.tail9f5972.ts.net:8443)
 (tailnet only; the existing `https://chupa.tail9f5972.ts.net/` app on :443 is unchanged).
 
-The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders.
+The page follows `data/prod-kxbtc15m.jsonl` live: book, tape, BRTI, countdown, BRTI−strike gap, and a local model P(YES) vs the book after taker fee. Pause, depth, and tape filters stay in the browser. Paper hints are not orders. When a paper session is running, the same page shows equity, cash, realized and unrealized PnL, the blotter, strategy params, adaptation events, and the session countdown. Times on the page are Europe/Amsterdam.
+
+## 24-hour paper session
+
+`paper-btc-15m` is a second process. It does not open the production WebSocket and it does not send orders. Leave `record-btc-15m` and `dashboard-btc-15m` running; the paper process only tails `data/prod-kxbtc15m.jsonl`.
+
+`KXBTC15M` is fee type `quadratic` with multiplier 1 (verified via `GET /series/KXBTC15M`): taker fee `ceil_6dp(0.07 × C × P × (1−P))`, maker fee 0. A yes/no settlement pays $1 per winning contract and charges no settlement fee. The session prefers the official market `result` and falls back to the BRTI compare only after three minutes.
+
+The `0.50` target is an aspirational KPI for the progress meter and for risk cuts when equity is behind a linear pace. It is not a forecast and not a promise.
+
+On the VPS, from the repo root, with `KALSHI_TRADE_ENV=paper`:
+
+```bash
+paper-btc-15m --bankroll 1000 --hours 24 --target-return 0.50
+```
+
+State lands in `data/paper-sessions/` (gitignored). A lock file stops a second paper process from double-trading. Restarting before `ends_at` resumes the same fake account. The dashboard at [http://127.0.0.1:8787](http://127.0.0.1:8787) picks the session up on its own. The strategy starts from the signal-edge bars (8¢ mid-window, 3¢ in the close minute) and may raise the bar or cut size when rolling PnL, hit rate, or the aspirational pace says so. It does not increase size to chase a deficit.
 
 Replay the last-minute paper hint against official settlements (local report, no orders):
 

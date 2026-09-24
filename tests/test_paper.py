@@ -142,6 +142,39 @@ def test_settlement_yes_when_close_avg_meets_strike() -> None:
     assert intent.pnl == Decimal("2") - Decimal("0.80")
 
 
+def test_taker_walks_visible_asks_without_overfill() -> None:
+    book = OrderbookState()
+    book.apply_snapshot(
+        _snapshot(
+            yes_dollars_fp=[["0.1000", "5.00"]],
+            no_dollars_fp=[["0.6000", "2.00"], ["0.5000", "3.00"]],
+        )
+    )
+    ledger = PaperLedger()
+    intent = PaperIntent(
+        market_ticker="KXBTC15M-TEST",
+        outcome="yes",
+        price=Decimal("0.50"),
+        count=Decimal("10"),
+        style="taker",
+    )
+    ledger.add(intent)
+    fills = ledger.on_book(book, ts_ms=1)
+    assert sum((fill.count for fill in fills), Decimal("0")) == Decimal("5")
+    assert intent.remaining == Decimal("5")
+    assert [fill.price for fill in fills] == [Decimal("0.40"), Decimal("0.50")]
+    second = PaperIntent(
+        market_ticker="KXBTC15M-TEST",
+        outcome="yes",
+        price=Decimal("0.99"),
+        count=Decimal("10"),
+        style="taker",
+    )
+    ledger.add(second)
+    assert ledger.on_book(book, ts_ms=2) == []
+    assert second.remaining == Decimal("10")
+
+
 def test_book_delta_does_not_fill_maker() -> None:
     book = OrderbookState()
     book.apply_snapshot(_snapshot())

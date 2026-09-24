@@ -17,6 +17,7 @@ from kalshi_bot.config import SERIES_TICKER_BTC_15M, Settings
 from kalshi_bot.discover import is_currently_open, parse_kxbtc15m_close, summarize_market
 from kalshi_bot.orderbook import OrderbookState
 from kalshi_bot.recorder import DEFAULT_JSONL, DEFAULT_LOCK
+from kalshi_bot.session import DEFAULT_SESSION_ROOT, read_session_view
 from kalshi_bot.signal import evaluate, sigma_from_samples, signal_to_dict
 
 _DISCOVER_INTERVAL_S = 15.0
@@ -61,10 +62,12 @@ class LiveFeed:
         jsonl_path: Path = DEFAULT_JSONL,
         lock_path: Path = DEFAULT_LOCK,
         settings: Settings | None = None,
+        session_dir: Path = DEFAULT_SESSION_ROOT,
     ) -> None:
         self.jsonl_path = jsonl_path
         self.lock_path = lock_path
         self.settings = settings
+        self.session_dir = session_dir
         self.book = OrderbookState()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -131,7 +134,7 @@ class LiveFeed:
                 book_ticker=self.book.market_ticker,
                 reference_ticker=str(reference) if reference else None,
             )
-            return {
+            payload = {
                 "recorder": self._recorder_status(),
                 "book_status": self._book_status,
                 "error": self._error,
@@ -154,6 +157,8 @@ class LiveFeed:
                 "streams": _stream_view(self._counts, rates),
                 "last_row_at": self._last_row_at,
             }
+        payload["paper_session"] = read_session_view(self.session_dir)
+        return payload
 
     def _run(self) -> None:
         while not self._stop.is_set():

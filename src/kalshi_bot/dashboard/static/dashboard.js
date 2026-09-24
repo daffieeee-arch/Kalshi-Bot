@@ -36,6 +36,41 @@ function countdown(closeAt) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function sessionCountdown(endsAt) {
+  if (!endsAt) return "--:--:--";
+  const ms = Date.parse(endsAt) - Date.now();
+  if (Number.isNaN(ms)) return "--:--:--";
+  if (ms <= 0) return "00:00:00";
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function fmtAmsterdam(iso) {
+  if (!iso) return "";
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return "";
+  return `${new Intl.DateTimeFormat("nl-NL", {
+    timeZone: "Europe/Amsterdam",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(dt)} Amsterdam`;
+}
+
+function fmtMoney(value) {
+  if (value == null || value === "") return "—";
+  const n = Number(value);
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+}
+
 function setPill(id, text, kind) {
   const el = $(id);
   el.textContent = text;
@@ -56,7 +91,7 @@ function render(data) {
 
   $("ticker").textContent = data.ticker || "waiting…";
   $("title").textContent = data.title || "";
-  $("close-at").textContent = data.close_at ? data.close_at.replace("T", " ") : "";
+  $("close-at").textContent = fmtAmsterdam(data.close_at);
   $("countdown").textContent = countdown(data.close_at);
   $("brti").textContent = fmtUsd(data.brti && data.brti.value);
   const closeAvg = data.brti && data.brti.close_avg;
@@ -69,10 +104,11 @@ function render(data) {
   $("strike").textContent = data.floor_strike
     ? `floor ${fmtUsd(data.floor_strike)} · NO ${fmtPx(book.no_bid)} / ${fmtPx(book.no_ask)}`
     : `NO ${fmtPx(book.no_bid)} / ${fmtPx(book.no_ask)}`;
-  $("file-meta").textContent = `${fmtBytes(recorder.bytes)} · ${data.last_row_at || ""}`;
+  $("file-meta").textContent = `${fmtBytes(recorder.bytes)} · ${fmtAmsterdam(data.last_row_at)}`;
   $("error").hidden = !data.error;
   $("error").textContent = data.error || "";
   renderSignal(data.signal || {});
+  renderPaper(data.paper_session);
   renderBook(book);
   renderTape(data.tape || []);
   renderRates(data.streams || []);
@@ -178,6 +214,131 @@ function renderSignal(signal) {
   }`;
 }
 
+function renderPaper(session) {
+  const running = Boolean(session && session.running);
+  setPill(
+    "paper-pill",
+    running ? "paper live" : session ? "paper idle" : "paper off",
+    running ? "live" : session ? "warn" : "off",
+  );
+  if (!session) {
+    $("paper-equity").textContent = "—";
+    $("paper-cash").textContent = "start paper-btc-15m";
+    $("paper-countdown").textContent = "--:--:--";
+    $("paper-ends").textContent = "no paper session";
+    $("paper-pnl").textContent = "—";
+    $("paper-pnl-meta").textContent = "realized — · unrealized —";
+    $("paper-progress-label").textContent = "—";
+    $("paper-progress").style.width = "0%";
+    $("paper-note").textContent = "aspirational KPI · not a forecast";
+    $("paper-win").textContent = "—";
+    $("paper-record").textContent = "no settled trades";
+    $("paper-strategy").textContent = "—";
+    $("paper-params").textContent = "";
+    fillRows("paper-adapt", [], "No adaptation yet.");
+    fillRows("paper-open", [], "No open paper trades.");
+    fillRows("paper-closed", [], "No closed paper trades.");
+    fillRows("paper-fills", [], "No paper fills.");
+    return;
+  }
+  $("paper-equity").textContent = fmtMoney(session.equity).replace("+", "");
+  $("paper-cash").textContent = `cash ${fmtMoney(session.cash).replace("+", "")} · start ${fmtMoney(session.bankroll).replace("+", "")}`;
+  $("paper-countdown").textContent = sessionCountdown(session.ends_at);
+  $("paper-ends").textContent = session.ends_at_amsterdam || fmtAmsterdam(session.ends_at);
+  const realized = Number(session.realized_pnl);
+  $("paper-pnl").textContent = fmtMoney(session.realized_pnl);
+  $("paper-pnl").className = `big mono ${realized >= 0 ? "yes" : "no"}`;
+  $("paper-pnl-meta").textContent = `realized ${fmtMoney(session.realized_pnl)} · unrealized ${fmtMoney(session.unrealized_pnl)}`;
+  const progress = session.progress == null ? null : Number(session.progress);
+  $("paper-progress-label").textContent = progress == null ? "—" : `${(progress * 100).toFixed(1)}%`;
+  const width = progress == null ? 0 : Math.max(0, Math.min(100, progress * 100));
+  $("paper-progress").style.width = `${width}%`;
+  $("paper-note").textContent = session.target_note || "aspirational KPI · not a forecast";
+  const win = session.win_rate == null ? null : Number(session.win_rate);
+  $("paper-win").textContent = win == null ? "—" : `${(win * 100).toFixed(0)}%`;
+  $("paper-record").textContent = `${session.wins || 0} wins · ${session.losses || 0} losses`;
+  $("paper-strategy").textContent = session.strategy || "—";
+  const params = session.params || {};
+  $("paper-params").textContent = params.mid_edge
+    ? `mid ${params.mid_edge} · last ${params.last_minute_edge} · size ${params.contracts} · maker bias ${params.maker_bias} · cooldown ${params.cooldown_s}s · risk ${params.max_open_risk}`
+    : "";
+  renderAdaptations(session.adaptations || []);
+  renderTrades("paper-open", session.open_trades || [], "No open paper trades.");
+  renderTrades("paper-closed", session.closed_trades || [], "No closed paper trades.");
+  renderFills(session.fills || []);
+}
+
+function renderAdaptations(rows) {
+  const root = $("paper-adapt");
+  root.replaceChildren();
+  if (!rows.length) {
+    root.append(emptyLine("No adaptation yet."));
+    return;
+  }
+  for (const row of rows.slice(0, 8)) {
+    const el = document.createElement("div");
+    el.className = "adapt-row";
+    const params = row.params || {};
+    el.innerHTML = `
+      <span class="muted">${row.at_amsterdam || ""}</span>
+      <span>${row.reason || ""} · size ${params.contracts || ""} · mid ${params.mid_edge || ""}</span>
+    `;
+    root.append(el);
+  }
+}
+
+function renderTrades(id, rows, empty) {
+  const root = $(id);
+  root.replaceChildren();
+  if (!rows.length) {
+    root.append(emptyLine(empty));
+    return;
+  }
+  for (const row of rows.slice(0, 20)) {
+    const el = document.createElement("div");
+    el.className = "trade-row";
+    const pnl = row.pnl == null ? "" : fmtMoney(row.pnl);
+    el.innerHTML = `
+      <span class="${row.outcome === "no" ? "no" : "yes"}">${(row.outcome || "").toUpperCase()} ${row.style || ""}</span>
+      <span>${row.ticker || ""} · ${row.filled || "0"} @ ${fmtPx(row.avg_price || row.limit)} · fee ${row.fee || "0"}</span>
+      <span class="muted">${pnl} ${row.at_amsterdam || ""}</span>
+    `;
+    root.append(el);
+  }
+}
+
+function renderFills(rows) {
+  const root = $("paper-fills");
+  root.replaceChildren();
+  if (!rows.length) {
+    root.append(emptyLine("No paper fills."));
+    return;
+  }
+  for (const row of rows.slice(0, 20)) {
+    const el = document.createElement("div");
+    el.className = "trade-row";
+    el.innerHTML = `
+      <span class="${row.outcome === "no" ? "no" : "yes"}">${(row.outcome || "").toUpperCase()} ${row.style || ""}</span>
+      <span>${row.count || ""} @ ${fmtPx(row.price)} · fee ${row.fee || "0"} · ${row.source || ""}</span>
+      <span class="muted">${row.at_amsterdam || ""}</span>
+    `;
+    root.append(el);
+  }
+}
+
+function fillRows(id, rows, empty) {
+  const root = $(id);
+  root.replaceChildren();
+  if (!rows.length) root.append(emptyLine(empty));
+}
+
+function emptyLine(text) {
+  const el = document.createElement("p");
+  el.className = "muted";
+  el.textContent = text;
+  return el;
+}
+
 function renderRates(streams) {
   const root = $("rates");
   root.replaceChildren();
@@ -209,7 +370,12 @@ function bind() {
     });
   });
   setInterval(() => {
-    if (state.latest) $("countdown").textContent = countdown(state.latest.close_at);
+    if (!state.latest) return;
+    $("countdown").textContent = countdown(state.latest.close_at);
+    const session = state.latest.paper_session;
+    if (session && session.ends_at) {
+      $("paper-countdown").textContent = sessionCountdown(session.ends_at);
+    }
   }, 250);
 }
 

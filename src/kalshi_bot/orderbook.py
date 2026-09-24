@@ -52,6 +52,18 @@ class OrderbookState:
     def size_at(self, side: Side, price: Decimal) -> Decimal:
         return self._book(side).get(price, Decimal("0"))
 
+    def ask_levels(self, side: Side) -> list[tuple[Decimal, Decimal]]:
+        """Visible asks from best to worst as ``(price, size)``.
+
+        Size lives on the opposite bid: a YES ask of ``1 - bid`` is the NO bid.
+        """
+        opposite: Side = "no" if side == "yes" else "yes"
+        book = self._book(opposite)
+        levels: list[tuple[Decimal, Decimal]] = []
+        for bid in sorted(book, reverse=True):
+            levels.append((Decimal("1") - bid, book[bid]))
+        return levels
+
     def apply_snapshot(self, message: dict[str, Any]) -> ApplyResult:
         sid = message.get("sid")
         seq = message.get("seq")
