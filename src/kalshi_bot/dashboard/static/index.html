@@ -15,6 +15,7 @@
       </div>
       <div class="status-row">
         <span id="recorder-pill" class="pill off">recorder</span>
+        <span id="paper-pill" class="pill off">paper</span>
         <span id="book-pill" class="pill off">book</span>
         <button id="pause" type="button">Pause</button>
       </div>
@@ -64,6 +65,63 @@
         <p id="hint" class="big mono">wait</p>
         <p id="hint-meta" class="muted">local only · no live orders</p>
       </article>
+    </section>
+
+    <section class="hero" id="paper-hero">
+      <article>
+        <p class="label">Paper equity</p>
+        <p id="paper-equity" class="big mono">—</p>
+        <p id="paper-cash" class="muted">cash —</p>
+      </article>
+      <article>
+        <p class="label">Session</p>
+        <p id="paper-countdown" class="big mono">--:--:--</p>
+        <p id="paper-ends" class="muted">no paper session</p>
+      </article>
+      <article>
+        <p class="label">PnL</p>
+        <p id="paper-pnl" class="big mono">—</p>
+        <p id="paper-pnl-meta" class="muted">realized — · unrealized —</p>
+      </article>
+      <article>
+        <p class="label">Target +50%</p>
+        <p id="paper-progress-label" class="big mono">—</p>
+        <div class="progress" aria-hidden="true"><span id="paper-progress"></span></div>
+        <p id="paper-note" class="muted">aspirational KPI · not a forecast</p>
+      </article>
+    </section>
+
+    <section class="hero">
+      <article>
+        <p class="label">Win rate</p>
+        <p id="paper-win" class="big mono">—</p>
+        <p id="paper-record" class="muted">no settled trades</p>
+      </article>
+      <article>
+        <p class="label">Strategy</p>
+        <p id="paper-strategy" class="big mono">—</p>
+        <p id="paper-params" class="muted"></p>
+      </article>
+      <article class="span-2">
+        <p class="label">Adaptations</p>
+        <div id="paper-adapt" class="tape"></div>
+      </article>
+    </section>
+
+    <section class="grid">
+      <section class="panel">
+        <h2>Open paper trades</h2>
+        <div id="paper-open" class="tape"></div>
+      </section>
+      <section class="panel">
+        <h2>Closed paper trades</h2>
+        <div id="paper-closed" class="tape"></div>
+      </section>
+    </section>
+
+    <section class="panel blotter">
+      <h2>Paper fills</h2>
+      <div id="paper-fills" class="tape"></div>
     </section>
 
     <section class="toolbar">

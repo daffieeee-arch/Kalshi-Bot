@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import sys
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import uvicorn
@@ -19,6 +19,7 @@ from kalshi_bot.discover import discover_btc_15m, format_market_line
 from kalshi_bot.paper import PaperIntent
 from kalshi_bot.recorder import DEFAULT_JSONL, run_recorder
 from kalshi_bot.replay import collect_tickers, fetch_markets, replay
+from kalshi_bot.session import DEFAULT_SESSION_ROOT, run_paper_session
 
 
 CREDENTIALS_HELP = """
@@ -189,6 +190,59 @@ def replay_main(argv: list[str] | None = None) -> None:
     parser = build_replay_parser()
     args = parser.parse_args(argv)
     raise SystemExit(cmd_replay_btc_15m(args))
+
+
+def build_paper_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="paper-btc-15m",
+        description=(
+            "Paper-only KXBTC15M session. Tails the recorder JSONL and keeps a "
+            "fake balance. Never sends orders. target-return is an aspirational KPI."
+        ),
+    )
+    parser.add_argument("--bankroll", default="1000", help="Starting fake dollars")
+    parser.add_argument("--hours", type=float, default=24, help="Session length")
+    parser.add_argument(
+        "--target-return",
+        default="0.50",
+        help="Aspirational return. 0.50 means plus 50 percent. Not a forecast.",
+    )
+    parser.add_argument("--jsonl", default=str(DEFAULT_JSONL), help="Recorder JSONL to tail")
+    parser.add_argument(
+        "--session-dir",
+        default=str(DEFAULT_SESSION_ROOT),
+        help="Where session state is written",
+    )
+    return parser
+
+
+def cmd_paper_btc_15m(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    settings = load_settings()
+    try:
+        bankroll = Decimal(args.bankroll)
+        target_return = Decimal(args.target_return)
+    except InvalidOperation as exc:
+        print(f"invalid bankroll or target-return: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return run_paper_session(
+            bankroll=bankroll,
+            hours=args.hours,
+            target_return=target_return,
+            jsonl_path=Path(args.jsonl),
+            session_root=Path(args.session_dir),
+            settings=settings,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+def paper_main(argv: list[str] | None = None) -> None:
+    parser = build_paper_parser()
+    args = parser.parse_args(argv)
+    raise SystemExit(cmd_paper_btc_15m(args))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ discover-btc-15m = "kalshi_bot.cli:main"
 record-btc-15m = "kalshi_bot.cli:record_main"
 dashboard-btc-15m = "kalshi_bot.cli:dashboard_main"
 replay-btc-15m = "kalshi_bot.cli:replay_main"
+paper-btc-15m = "kalshi_bot.cli:paper_main"
 
 [tool.setuptools.package-data]
 kalshi_bot = ["dashboard/static/*"]
